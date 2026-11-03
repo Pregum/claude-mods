@@ -1,3 +1,4 @@
+import type { On } from 'claude-code'
 import { expect, test } from 'claude-code/testing'
 
 const PANE = {
@@ -45,7 +46,7 @@ const queuedTail = [
 ].join('\n')
 
 const fakeHost = (
-  on: Parameters<Parameters<typeof test>[1]>[1],
+  on: On,
   sends: string[],
   tailText = tail,
 ) => {
@@ -137,14 +138,21 @@ test('このワークスペースのセッションだけを並べ、のぞい�
     expect(await ui.find({ type: 'Button', key: `open:${BG}` })).toBeDefined()
     expect(await ui.find({ type: 'Button', key: `web:${BG}` })).toBeDefined()
 
-    if (surface !== 'mobile') {
-      await ui.input({ key: `send:${BG}:${sends.length}`, text: 'テストを足して' })
-      expect(sends.at(-1)).toContain('テストを足して')
-    }
-
     // もう一度押すと畳む
     await ui.press({ key: `row:${BG}` })
     expect(await ui.find({ type: 'Text', text: /README を直して/ })).toBeUndefined()
+    await ui.unmount()
+  }
+  expect(sends.length).toBe(0)
+
+  // 送る欄は Input のある描画先だけ (mobile には無い)
+  for (const surface of ['terminal', 'desktop', 'vscode'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'refresh' })
+    await ui.press({ key: `row:${BG}` })
+    await ui.input({ key: `send:${BG}:${sends.length}`, text: 'テストを足して' })
+    expect(sends.at(-1)).toContain('テストを足して')
+    await ui.press({ key: `row:${BG}` })
     await ui.unmount()
   }
   expect(sends.length).toBe(3)
