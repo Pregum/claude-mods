@@ -50,6 +50,10 @@ declare module 'claude-code' {
       peek: Shaped<WsPeek | null>
       showAll: boolean
       sent: number
+      /** 詳細 (最後の依頼と返答) を開いているか。d で切り替え、移動しても保つ */
+      showDetail: boolean
+      /** 送る欄を出しているセッション。Enter / i で出し、移動か送信で消す */
+      typing: string | null
     }
   }
 }

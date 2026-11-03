@@ -24,6 +24,8 @@ const peeked = atom({ plugin: 'workspace-sessions', key: 'peek' } as const, null
 })
 const showAll = atom({ plugin: 'workspace-sessions', key: 'showAll' } as const, false)
 const sent = atom({ plugin: 'workspace-sessions', key: 'sent' } as const, 0)
+const showDetail = atom({ plugin: 'workspace-sessions', key: 'showDetail' } as const, false)
+const typing = atom({ plugin: 'workspace-sessions', key: 'typing' } as const, null)
 
 const message = (err: unknown): string => (err instanceof Error ? err.message : String(err))
 
@@ -97,7 +99,20 @@ const metaOf = (s: WsSession, now: number): string =>
     .filter(Boolean)
     .join(' · ')
 
-// ---- 動き ----
+const canSend = (s: WsSession): boolean => s.isRunning && !s.isSelf
+
+/** いま並んでいる順 (畳んだ過去は数えない): j / k はこの順に動く */
+const visibleOf = (snap: WsSnapshot | null, all: boolean): WsSession[] => {
+  if (!snap) return []
+  const live = snap.sessions.filter(s => s.kind !== 'past')
+  const past = snap.sessions.filter(s => s.kind === 'past')
+  return [...live, ...(all ? past : past.slice(0, PAST_FOLDED))]
+}
+
+const rowKey = (s: WsSession): string => `row:${s.sessionId}`
+const sendKey = (s: WsSession, n: number): string => `send:${s.sessionId}:${n}`
+
+// ---- 一覧を読む ----
 
 let inFlight: Promise<void> | undefined
 
@@ -131,77 +146,92 @@ async function isPaneOpen($: Engine): Promise<boolean> {
   }
 }
 
-const canSend = (s: WsSession): boolean => s.isRunning && !s.isSelf
-
-/** いま並んでいる順 (畳んだ過去は数えない): j / k はこの順に動く */
-const visibleOf = (snap: WsSnapshot | null, all: boolean): WsSession[] => {
-  if (!snap) return []
-  const live = snap.sessions.filter(s => s.kind !== 'past')
-  const past = snap.sessions.filter(s => s.kind === 'past')
-  return [...live, ...(all ? past : past.slice(0, PAST_FOLDED))]
+async function selectedSession($: Engine): Promise<WsSession | undefined> {
+  const list = visibleOf(await read($, snapshot), await read($, showAll))
+  const chosen = await read($, selected)
+  return list.find(s => s.sessionId === chosen)
 }
 
-const rowKey = (s: WsSession): string => `row:${s.sessionId}`
-const sendKey = (s: WsSession, n: number): string => `send:${s.sessionId}:${n}`
+// ---- 動き ----
 
-/** 押したのが person の入力のときだけ動く。動かなくても困らないので結果は見ない */
+/** フォーカスの輪をその要素へ (見えるところまで送る)。動かなくても困らないので結果は見ない */
 async function ring($: Engine, key: string): Promise<void> {
   await $.ui.focus({ requestId: PANE, key }).catch(() => undefined)
   await $.ui.scroll({ in: PANE, to: { key } }).catch(() => undefined)
 }
 
-/** 選んで、そのセッションの最後の依頼と返答をのぞく */
-async function select($: Engine, s: WsSession): Promise<void> {
-  await update($, selected, () => s.sessionId)
+/** 詳細を開いているときだけ、そのセッションの最後の依頼と返答を読む */
+async function loadPeek($: Engine, s: WsSession): Promise<void> {
+  const cur = await read($, peeked)
+  if (cur?.sessionId === s.sessionId && !cur.error) return
   await update($, peeked, () => ({ sessionId: s.sessionId, isLoading: true }))
   const seen = await peek($, s)
-  await update($, peeked, cur => (cur?.sessionId === s.sessionId ? seen : cur))
+  await update($, peeked, now => (now?.sessionId === s.sessionId ? seen : now))
 }
 
-/** 選んでいるセッションの送る欄へ。送れないもの (自分・止まったもの) は知らせるだけ */
-async function typeInto($: Engine, s: WsSession): Promise<void> {
-  if (!canSend(s)) {
-    $.ui.toast(s.isSelf ? 'いま見ているセッションです' : '止まっているので送れません。o で開けます')
-    return
-  }
-  await ring($, sendKey(s, await read($, sent)))
+/** 選ぶ。行の下には何も広げない (詳細は d で開いているときだけ) */
+async function select($: Engine, s: WsSession): Promise<void> {
+  await update($, selected, () => s.sessionId)
+  await update($, typing, () => null)
+  if (await read($, showDetail)) await loadPeek($, s)
 }
 
-/**
- * 行を押す (Enter・数字): 選ぶ。もう選んでいる行なら送る欄へ飛ぶ。
- * 畳まない: 選んでいる位置が j / k の起点なので、外すと先頭に戻ってしまう
- */
-async function choose($: Engine, s: WsSession): Promise<void> {
-  if ((await read($, selected)) === s.sessionId) {
-    await typeInto($, s)
-    return
-  }
-  await select($, s)
-}
-
-/** j / k: 次・前の行を選び、フォーカスもそこへ (Enter でそのまま送る欄へ行ける) */
+/** j / k: 次・前の行を選び、フォーカスもそこへ */
 async function move($: Engine, delta: number): Promise<void> {
   const list = visibleOf(await read($, snapshot), await read($, showAll))
   if (list.length === 0) return
   const chosen = await read($, selected)
   const at = list.findIndex(s => s.sessionId === chosen)
-  const index = at < 0 ? (delta > 0 ? 0 : list.length - 1) : Math.min(list.length - 1, Math.max(0, at + delta))
+  const index =
+    at < 0 ? (delta > 0 ? 0 : list.length - 1) : Math.min(list.length - 1, Math.max(0, at + delta))
   const next = list[index]
   if (!next) return
   await ring($, rowKey(next))
   if (next.sessionId !== chosen) await select($, next)
 }
 
-/** i: 選んでいる行の送る欄へ。何も選んでいなければ最初の行を選ぶ */
-async function typeSelected($: Engine): Promise<void> {
-  const list = visibleOf(await read($, snapshot), await read($, showAll))
-  const chosen = await read($, selected)
-  const s = list.find(one => one.sessionId === chosen)
-  if (s) {
-    await typeInto($, s)
+/** d: 詳細の開け閉め。開いたまま j / k で動けば、移った先の詳細を出す */
+async function toggleDetail($: Engine): Promise<void> {
+  await update($, showDetail, v => !v)
+  const s = await selectedSession($)
+  if (s && (await read($, showDetail))) await loadPeek($, s)
+}
+
+/** Enter / i: その行の下に送る欄を出して、フォーカスをそこへ */
+async function typeInto($: Engine, s: WsSession, surface: RenderSurface): Promise<void> {
+  if (!canSend(s)) {
+    $.ui.toast(s.isSelf ? 'いま見ているセッションです' : '止まっているので送れません。o で開けます')
     return
   }
-  await move($, 1)
+  if (surface === 'mobile') {
+    $.ui.toast('この画面には入力欄がありません')
+    return
+  }
+  await update($, typing, () => s.sessionId)
+  await ring($, sendKey(s, await read($, sent)))
+}
+
+/** 行を押す (Enter・数字): 選ぶ。もう選んでいる行なら、送れるものは送る欄へ、送れないものは詳細の開け閉め */
+async function choose($: Engine, s: WsSession, surface: RenderSurface): Promise<void> {
+  if ((await read($, selected)) !== s.sessionId) {
+    await select($, s)
+    return
+  }
+  if (canSend(s)) await typeInto($, s, surface)
+  else await toggleDetail($)
+}
+
+/** 選んでいる行に効く操作 (i / o / c / w)。選んでいなければ知らせる */
+async function onSelected(
+  $: Engine,
+  act: (s: WsSession) => Promise<void>,
+): Promise<void> {
+  const s = await selectedSession($)
+  if (!s) {
+    $.ui.toast('先に j / k で選んでください')
+    return
+  }
+  await act(s)
 }
 
 async function copyCommand($: Engine, s: WsSession, surface: RenderSurface): Promise<void> {
@@ -217,7 +247,7 @@ async function copyCommand($: Engine, s: WsSession, surface: RenderSurface): Pro
 
 async function openWeb($: Engine, s: WsSession): Promise<void> {
   if (!s.webUrl) {
-    $.ui.toast('Web のリンクがありません (Remote Control が切れています)')
+    $.ui.toast('Web のリンクがありません (Remote Control がつながっていません)')
     return
   }
   try {
@@ -278,14 +308,20 @@ async function sendTo($: Engine, s: WsSession, text: string): Promise<void> {
   const body = text.trim()
   if (!body) return
   const result = await $.session.send({ to: { sessionId: s.sessionId }, text: body })
-  if (result.isDelivered) {
-    await update($, sent, n => n + 1)
-    $.ui.toast(`送りました → ${s.name}`)
-    // 一覧に戻す: 続けて j / k で動ける
-    await ring($, rowKey(s))
-  } else {
+  if (!result.isDelivered) {
     $.ui.toast(`送れませんでした: ${result.reason}`)
+    return
   }
+  await update($, sent, n => n + 1)
+  await update($, typing, () => null)
+  $.ui.toast(`送りました → ${s.name}`)
+  // 一覧に戻す: 続けて j / k で動ける
+  await ring($, rowKey(s))
+}
+
+async function closePane($: Engine): Promise<void> {
+  await update($, typing, () => null)
+  await $.ui.close({ id: PANE }).catch(() => undefined)
 }
 
 // ---- フック ----
@@ -294,7 +330,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: COMMAND,
-      description: 'このワークスペースのセッション一覧 (のぞく・開く・送る)',
+      description: 'このワークスペースのセッション一覧 (j / k で選び、のぞく・開く・送る)',
     })
     // 開いている間だけ描き直す。モジュールが読み直されるとタイマーも作り直される
     $.clock.every(EVERY_MS, () => {
@@ -312,7 +348,8 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const els = $.ui.resolve(e)
     const { Box, Text, Button } = els
-    const Input = 'Input' in els ? els.Input : undefined
+    // mobile には入力欄が無い (表に名前があっても描けない)
+    const Input = e.surface !== 'mobile' && 'Input' in els ? els.Input : undefined
 
     const snap = await read($, snapshot)
     const loading = await read($, isLoading)
@@ -320,28 +357,35 @@ export const register: Register = on => {
     const seen = await read($, peeked)
     const all = await read($, showAll)
     const sentCount = await read($, sent)
+    const isDetailed = await read($, showDetail)
+    const typingId = await read($, typing)
     const now = await $.clock.now()
     const width = Math.max(24, e.props.bodyColumns)
 
-    const header = (
-      <Box flexDirection="row" justifyContent="space-between">
-        <Text bold>{fit(snap?.label || 'このワークスペース', width - 10)}</Text>
-        <Button
-          key="refresh"
-          plain
-          dimColor
-          hotkey="r"
-          label={loading ? '更新中…' : '更新'}
-          onPress={() => void refresh($)}
-        />
+    const key = (k: string, hotkey: string, label: string, act: () => Promise<void>) => (
+      <Button key={k} plain dimColor hotkey={hotkey} label={label} onPress={() => void act()} />
+    )
+    // 選んでいる行に効く操作も含め、キーはここにまとめる (詳細を閉じていても効く)
+    const keys = (
+      <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
+        {key('next', 'j', '次', () => move($, 1))}
+        {key('prev', 'k', '前', () => move($, -1))}
+        {key('detail', 'd', isDetailed ? '詳細を閉じる' : '詳細', () => toggleDetail($))}
+        {Input && key('type', 'i', '打つ', () => onSelected($, s => typeInto($, s, e.surface)))}
+        {key('open', 'o', '開く', () => onSelected($, s => openSession($, s, e.surface)))}
+        {key('copy', 'c', 'コピー', () => onSelected($, s => copyCommand($, s, e.surface)))}
+        {key('web', 'w', 'Web', () => onSelected($, s => openWeb($, s)))}
+        {key('refresh', 'r', loading ? '更新中…' : '更新', () => refresh($))}
+        {key('close', 'q', '閉じる', () => closePane($))}
       </Box>
     )
 
     if (!snap) {
       return (
         <Box flexDirection="column">
-          {header}
-          <Text dimColor>{loading ? '読み込み中…' : '「更新」で読み込みます'}</Text>
+          <Text bold>このワークスペース</Text>
+          <Text dimColor>{loading ? '読み込み中…' : 'r で読み込みます'}</Text>
+          {keys}
         </Box>
       )
     }
@@ -353,38 +397,10 @@ export const register: Register = on => {
     const hasChosen = visibleOf(snap, all).some(s => s.sessionId === chosen)
     let hot = 0
 
-    const row = (s: WsSession) => {
-      hot += 1
-      const hotkey = hot <= 9 ? String(hot) : undefined
-      const dot = dotOf(s)
-      const meta = metaOf(s, now)
-      const room = width - (hotkey ? 3 : 0) - 2 - cells(meta) - 1
-      const isOpen = chosen === s.sessionId
-      // ペインに入ったとき、フォーカスは選んでいる行 (なければ先頭) から
-      const isFocusHere = isOpen || (!hasChosen && hot === 1)
-      return (
-        <Box key={`item:${s.sessionId}`} flexDirection="column">
-          <Button
-            key={rowKey(s)}
-            plain
-            {...(hotkey ? { hotkey } : {})}
-            {...(isFocusHere ? { autoFocus: true as const } : {})}
-            onPress={() => void choose($, s)}
-          >
-            <Text {...(dot.color ? { color: dot.color } : { dimColor: true })}>{dot.glyph}</Text>{' '}
-            <Text bold={isOpen}>{fit(s.name, Math.max(8, room))}</Text>{' '}
-            <Text dimColor>{meta}</Text>
-          </Button>
-          {isOpen && detail(s)}
-        </Box>
-      )
-    }
-
     const detail = (s: WsSession) => {
       const mine = seen?.sessionId === s.sessionId ? seen : undefined
-      const command = commandFor(s)
       return (
-        <Box flexDirection="column" paddingLeft={2} marginBottom={1}>
+        <Box flexDirection="column" paddingLeft={4} marginBottom={1}>
           {(!mine || mine.isLoading) && <Text dimColor>のぞいています…</Text>}
           {mine?.error && <Text dimColor>{mine.error}</Text>}
           {mine?.prompt && <Text dimColor>最後の依頼</Text>}
@@ -396,41 +412,45 @@ export const register: Register = on => {
           {mine && !mine.isLoading && !mine.error && !mine.prompt && !mine.reply && (
             <Text dimColor>まだ発言がありません</Text>
           )}
-          <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
-            {!s.isSelf && (command || s.webUrl) && (
-              <Button
-                key={`open:${s.sessionId}`}
-                variant="primary"
-                hotkey="o"
-                label={s.kind === 'past' ? '再開' : command ? '開く' : 'Web で開く'}
-                onPress={press => void openSession($, s, press.surface)}
+        </Box>
+      )
+    }
+
+    const row = (s: WsSession) => {
+      hot += 1
+      const hotkey = hot <= 9 ? String(hot) : undefined
+      const dot = dotOf(s)
+      const meta = metaOf(s, now)
+      const isHere = chosen === s.sessionId
+      // ペインに入ったとき、フォーカスは選んでいる行 (なければ先頭) から
+      const isFocusHere = isHere || (!hasChosen && hot === 1)
+      const room = width - (hotkey ? 3 : 0) - 4 - cells(meta) - 1
+      return (
+        <Box key={`item:${s.sessionId}`} flexDirection="column">
+          <Button
+            key={rowKey(s)}
+            plain
+            {...(hotkey ? { hotkey } : {})}
+            {...(isFocusHere ? { autoFocus: true as const } : {})}
+            onPress={press => void choose($, s, press.surface)}
+          >
+            <Text color="claude" bold>{isHere ? '›' : ' '}</Text>{' '}
+            <Text {...(dot.color ? { color: dot.color } : { dimColor: true })}>{dot.glyph}</Text>{' '}
+            <Text bold={isHere} underline={isHere}>{fit(s.name, Math.max(8, room))}</Text>{' '}
+            <Text dimColor>{meta}</Text>
+          </Button>
+          {isHere && isDetailed && detail(s)}
+          {isHere && typingId === s.sessionId && canSend(s) && Input && (
+            <Box paddingLeft={4}>
+              <Input
+                key={sendKey(s, sentCount)}
+                label="送る "
+                placeholder="打って Enter で送る (↑ で一覧へ)"
+                submitLabel="送る"
+                autoFocus
+                onSubmit={value => void sendTo($, s, value)}
               />
-            )}
-            {command && (
-              <Button
-                key={`copy:${s.sessionId}`}
-                hotkey="c"
-                label="コマンドをコピー"
-                onPress={press => void copyCommand($, s, press.surface)}
-              />
-            )}
-            {s.webUrl && command && (
-              <Button
-                key={`web:${s.sessionId}`}
-                hotkey="w"
-                label="Web"
-                onPress={() => void openWeb($, s)}
-              />
-            )}
-          </Box>
-          {canSend(s) && Input && (
-            <Input
-              key={sendKey(s, sentCount)}
-              label="送る "
-              placeholder="Enter か i でここへ。打って Enter で送る"
-              submitLabel="送る"
-              onSubmit={value => void sendTo($, s, value)}
-            />
+            </Box>
           )}
         </Box>
       )
@@ -438,19 +458,15 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column">
-        {header}
+        <Text bold>{fit(snap.label || 'このワークスペース', width)}</Text>
         <Text dimColor>
           {fit(
-            `動いている ${runningCount} · 過去 ${past.length} · ${ago(snap.loadedAt, now)}に更新`,
+            `動いている ${runningCount} · 過去 ${past.length} · ${loading ? '更新中…' : `${ago(snap.loadedAt, now)}に更新`}`,
             width,
           )}
         </Text>
         {snap.error && <Text color="error">{fit(snap.error, width * 2)}</Text>}
-        <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
-          <Button key="next" plain dimColor hotkey="j" label="次" onPress={() => void move($, 1)} />
-          <Button key="prev" plain dimColor hotkey="k" label="前" onPress={() => void move($, -1)} />
-          <Button key="type" plain dimColor hotkey="i" label="打つ" onPress={() => void typeSelected($)} />
-        </Box>
+        {keys}
         {live.length > 0 && <Text dimColor>─ いまのセッション</Text>}
         {live.map(row)}
         {past.length > 0 && <Text dimColor>─ 過去のセッション</Text>}

@@ -37,28 +37,31 @@ const tail = [
   '{"type":"assistant","timestamp":"2026-11-03T01:55:00Z","message":{"role":"assistant","content":[{"type":"text","text":"README を直しました"}]}}',
 ].join('\n')
 
-type Ran = { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean; isStderrTruncated: boolean }
-const ok = (stdout: string): Ran => ({ exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false })
-
 const queuedTail = [
   tail,
   '{"type":"attachment","timestamp":"2026-11-03T01:58:00Z","attachment":{"type":"queued_command","prompt":"ついでに CHANGELOG も","origin":{"kind":"human"}}}',
 ].join('\n')
 
-const focused: string[] = []
+type Ran = { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean; isStderrTruncated: boolean }
+const ok = (stdout: string): Ran => ({ exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false })
 
-const fakeHost = (
-  on: On,
-  sends: string[],
-  tailText = tail,
-  toasts: string[] = [],
-) => {
+/** エンジンの代わり。何が起きたかを返す */
+const fakeHost = (on: On, tailText = tail) => {
+  const seen = { sends: [] as string[], toasts: [] as string[], copies: [] as string[], closed: [] as string[] }
   on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/h' : undefined }))
   on('session.id', () => ({ value: SELF }))
   on('session.root', () => ({ value: '/w/repo' }))
   on('clock.now', () => ({ value: NOW }))
   on('ui.toast', (_, e) => {
-    toasts.push(e.text)
+    seen.toasts.push(e.text)
+    return { value: undefined }
+  })
+  on('ui.copy', (_, e) => {
+    seen.copies.push(e.text)
+    return { value: { isCopied: true } }
+  })
+  on('ui.close', (_, e) => {
+    seen.closed.push(e.id)
     return { value: undefined }
   })
   on('fs.read', (_, e) => ({
@@ -71,7 +74,14 @@ const fakeHost = (
       return { value: [dir('-w-repo'), dir('-w-repo--claude-worktrees-feat'), dir('-w-repo-old'), dir('-x')] }
     }
     if (e.path === `${P}/-w-repo`) {
-      return { value: [file(`${BG}.jsonl`, NOW - 30_000), file(`${SELF}.jsonl`, NOW), file(`${OLD}.jsonl`, NOW - 2 * 86_400_000), file(`${UNTITLED}.jsonl`, NOW - 3 * 86_400_000)] }
+      return {
+        value: [
+          file(`${BG}.jsonl`, NOW - 30_000),
+          file(`${SELF}.jsonl`, NOW),
+          file(`${OLD}.jsonl`, NOW - 2 * 86_400_000),
+          file(`${UNTITLED}.jsonl`, NOW - 3 * 86_400_000),
+        ],
+      }
     }
     if (e.path === `${P}/-w-repo--claude-worktrees-feat`) return { value: [file(`${TERM}.jsonl`, NOW - 120_000)] }
     if (e.path === `${P}/-w-repo-old`) return { value: [file(`${SIBLING}.jsonl`, NOW - 1000)] }
@@ -114,66 +124,146 @@ const fakeHost = (
     if (bin === 'tail') return { value: ok(`truncated…\n${tailText}\n`) }
     return { value: { ...ok(''), exitCode: 127, stderr: `no ${bin}` } }
   })
-  on('ui.focus', (_, e) => {
-    if (e.element) focused.push(e.element)
-    return {}
-  })
-  on('ui.scroll', () => ({}))
   on('session.send', (_, e) => {
-    sends.push(`${e.to} ${e.text}`)
+    seen.sends.push(`${e.to} ${e.text}`)
     return { isDelivered: true }
   })
+  return seen
 }
 
-test('このワークスペースのセッションだけを並べ、のぞいて送れる', async ($, on) => {
-  const sends: string[] = []
-  fakeHost(on, sends)
+const README_ASK = /README を直して/
+const README_DONE = /README を直しました/
 
+test('このワークスペースのセッションだけを並べる', async ($, on) => {
+  fakeHost(on)
   for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     await ui.press({ key: 'refresh' })
-
     expect(await ui.find({ type: 'Text', text: /バックの仕事/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /feat-term/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /このセッション/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /昔の"調べもの"/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /wt:feat/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /\/deploy prod/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /wt:feat/ })).toBeDefined()
     // よそのリポジトリ (cwd が外、名前だけ似たフォルダ) は出さない
     expect(await ui.find({ type: 'Text', text: /よその仕事/ })).toBeUndefined()
     expect(await ui.find({ type: 'Text', text: /eeee5555/ })).toBeUndefined()
-
-    await ui.press({ key: `row:${BG}` })
-    expect((await ui.find({ type: 'Text', text: /README を直して/ }))?.text).toBe('README を直して')
-    expect(await ui.find({ type: 'Text', text: /README を直しました/ })).toBeDefined()
-    expect(await ui.find({ type: 'Button', key: `open:${BG}` })).toBeDefined()
-    expect(await ui.find({ type: 'Button', key: `web:${BG}` })).toBeDefined()
-
-    // もう一度押しても畳まない (送る欄へ飛ぶ)
-    await ui.press({ key: `row:${BG}` })
-    expect(await ui.find({ type: 'Text', text: /README を直して/ })).toBeDefined()
     await ui.unmount()
   }
-  expect(sends.length).toBe(0)
+})
 
-  // 送る欄は Input のある描画先だけ (mobile には無い)
+test('j / k で動いても詳細は広がらず、d で開け閉めし、開いたままなら移った先を出す', async ($, on) => {
+  const seen = fakeHost(on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'refresh' })
+  // 選んでいる行は c (コピー) が何をコピーするかで分かる
+  const here = async () => {
+    const copies = seen.copies.length
+    await ui.press({ key: 'copy' })
+    return seen.copies.length > copies ? seen.copies.at(-1) : seen.toasts.at(-1)
+  }
+
+  // 並び: 作業中 (新しい順: 自分 → バック) → 待機 (端末) → 過去
+  await ui.press({ key: 'next' })
+  expect(await here()).toContain('claude attach cccc3333')
+  await ui.press({ key: 'next' })
+  expect(await here()).toContain('claude attach aaaa1111')
+  expect(await ui.find({ type: 'Text', text: README_DONE })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /›/ })).toBeDefined()
+
+  await ui.press({ key: 'detail' })
+  expect(await ui.find({ type: 'Text', text: README_ASK })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: README_DONE })).toBeDefined()
+  // 開いたまま動くと、移った先の詳細
+  await ui.press({ key: 'prev' })
+  expect(await here()).toContain('claude attach cccc3333')
+  expect(await ui.find({ type: 'Text', text: README_DONE })).toBeDefined()
+  await ui.press({ key: 'detail' })
+  expect(await ui.find({ type: 'Text', text: README_DONE })).toBeUndefined()
+
+  await ui.press({ key: 'next' })
+  await ui.press({ key: 'next' })
+  expect(await here()).toMatch(/別の端末/)
+  await ui.press({ key: 'next' })
+  expect(await here()).toContain(`claude --resume ${OLD}`)
+  // 送れない行で Enter: 詳細の開け閉め
+  await ui.press({ key: `row:${OLD}` })
+  expect(await ui.find({ type: 'Text', text: README_DONE })).toBeDefined()
+  await ui.press({ key: `row:${OLD}` })
+  expect(await ui.find({ type: 'Text', text: README_DONE })).toBeUndefined()
+  // 端で止まる
+  for (let i = 0; i < 3; i += 1) await ui.press({ key: 'next' })
+  expect(await here()).toContain(`claude --resume ${UNTITLED}`)
+  await ui.unmount()
+})
+
+test('Enter か i で送る欄が出て、送ると消える。移動しても消える', async ($, on) => {
+  const seen = fakeHost(on)
   for (const surface of ['terminal', 'desktop', 'vscode'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     await ui.press({ key: 'refresh' })
-    await ui.input({ key: `send:${BG}:${sends.length}`, text: 'テストを足して' })
-    expect(sends.at(-1)).toContain('テストを足して')
+    await ui.press({ key: `row:${BG}` })
+    const n = seen.sends.length
+    expect(await ui.find({ key: `send:${BG}:${n}` })).toBeUndefined()
+
+    await ui.press({ key: `row:${BG}` }) // 選んでいる行で Enter
+    expect(await ui.find({ key: `send:${BG}:${n}` })).toBeDefined()
+    await ui.input({ key: `send:${BG}:${n}`, text: 'テストを足して' })
+    expect(seen.sends.at(-1)).toContain('テストを足して')
+    expect(await ui.find({ key: `send:${BG}:${n + 1}` })).toBeUndefined()
+
+    await ui.press({ key: 'type' }) // i
+    expect(await ui.find({ key: `send:${BG}:${n + 1}` })).toBeDefined()
+    await ui.press({ key: 'next' })
+    expect(await ui.find({ key: `send:${BG}:${n + 1}` })).toBeUndefined()
     await ui.unmount()
   }
-  expect(sends.length).toBe(3)
+  expect(seen.sends.length).toBe(3)
 })
 
-test('自分自身には開く・送るを出さない', async ($, on) => {
-  fakeHost(on, [])
+test('mobile には送る欄も i も無い', async ($, on) => {
+  fakeHost(on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'mobile' })
+  await ui.press({ key: 'refresh' })
+  expect(await ui.find({ type: 'Button', key: 'type' })).toBeUndefined()
+  await ui.press({ key: `row:${BG}` })
+  await ui.press({ key: `row:${BG}` })
+  expect(await ui.find({ key: `send:${BG}:0` })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('自分自身には送る欄を出さず、開くも止める', async ($, on) => {
+  const seen = fakeHost(on)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await ui.press({ key: 'refresh' })
   await ui.press({ key: `row:${SELF}` })
-  expect(await ui.find({ type: 'Button', key: `open:${SELF}` })).toBeUndefined()
+  await ui.press({ key: 'type' })
   expect(await ui.find({ key: `send:${SELF}:0` })).toBeUndefined()
+  expect(seen.toasts.at(-1)).toMatch(/いま見ている/)
+  await ui.press({ key: 'open' })
+  expect(seen.toasts.at(-1)).toMatch(/いま見ている/)
+  await ui.unmount()
+})
+
+test('q で閉じる。選んでいないときの o は知らせるだけ', async ($, on) => {
+  const seen = fakeHost(on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'refresh' })
+  await ui.press({ key: 'open' })
+  expect(seen.toasts.at(-1)).toMatch(/先に j \/ k で選んで/)
+  await ui.press({ key: 'close' })
+  expect(seen.closed).toEqual(['workspace-sessions'])
+  await ui.unmount()
+})
+
+test('作業中に届いた依頼を最後の依頼として見せ、返答はまだと示す', async ($, on) => {
+  fakeHost(on, queuedTail)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'refresh' })
+  await ui.press({ key: `row:${BG}` })
+  await ui.press({ key: 'detail' })
+  expect((await ui.find({ type: 'Text', text: /CHANGELOG/ }))?.text).toBe('ついでに CHANGELOG も')
+  expect(await ui.find({ type: 'Text', text: /ひとつ前の依頼へ/ })).toBeDefined()
   await ui.unmount()
 })
 
@@ -183,58 +273,6 @@ test('前の版が残した形の違う値は読まない', async ($, on) => {
     e.key === 'snapshot' ? { value: { value: { sessions: 'broken' }, version: 1 } } : next(e),
   )
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect(await ui.find({ type: 'Text', text: /「更新」で読み込みます/ })).toBeDefined()
-  await ui.unmount()
-})
-
-test('作業中に届いた依頼を最後の依頼として見せ、返答はまだと示す', async ($, on) => {
-  fakeHost(on, [], queuedTail)
-  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  await ui.press({ key: 'refresh' })
-  await ui.press({ key: `row:${BG}` })
-  expect((await ui.find({ type: 'Text', text: /CHANGELOG/ }))?.text).toBe('ついでに CHANGELOG も')
-  expect(await ui.find({ type: 'Text', text: /ひとつ前の依頼へ/ })).toBeDefined()
-  await ui.unmount()
-})
-
-test('j / k で動き、選んだ行で Enter か i を押しても畳まない', async ($, on) => {
-  const toasts: string[] = []
-  fakeHost(on, [], tail, toasts)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  await ui.press({ key: 'refresh' })
-  // 開いている行は、その行の「コマンドをコピー」か送る欄で分かる
-  const isOpen = async (id: string) =>
-    (await ui.find({ key: `copy:${id}` })) !== undefined ||
-    (await ui.find({ key: `send:${id}:0` })) !== undefined
-
-  // 並び: 作業中 (新しい順: 自分 → バック) → 待機 (端末) → 過去
-  await ui.press({ key: 'next' })
-  expect(await isOpen(SELF)).toBe(true)
-  await ui.press({ key: 'next' })
-  expect(await isOpen(BG)).toBe(true)
-  expect(await isOpen(SELF)).toBe(false)
-  await ui.press({ key: 'prev' })
-  expect(await isOpen(SELF)).toBe(true)
-  await ui.press({ key: 'next' })
-
-  // 選んでいる行をもう一度 (Enter) / i: 畳まない
-  await ui.press({ key: `row:${BG}` })
-  expect(await isOpen(BG)).toBe(true)
-  await ui.press({ key: 'type' })
-  expect(await isOpen(BG)).toBe(true)
-
-  await ui.press({ key: 'next' })
-  expect(await isOpen(TERM)).toBe(true)
-  await ui.press({ key: 'next' })
-  expect(await isOpen(OLD)).toBe(true)
-  // 送れない行で Enter: 畳まずに知らせるだけ。続けて j で次へ
-  await ui.press({ key: `row:${OLD}` })
-  expect(await isOpen(OLD)).toBe(true)
-  expect(toasts.at(-1)).toMatch(/o で開けます/)
-  await ui.press({ key: 'next' })
-  expect(await isOpen(UNTITLED)).toBe(true)
-  // 端で止まる
-  await ui.press({ key: 'next' })
-  expect(await isOpen(UNTITLED)).toBe(true)
+  expect(await ui.find({ type: 'Text', text: /r で読み込みます/ })).toBeDefined()
   await ui.unmount()
 })
