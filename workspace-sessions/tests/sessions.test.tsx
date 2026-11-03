@@ -45,16 +45,22 @@ const queuedTail = [
   '{"type":"attachment","timestamp":"2026-11-03T01:58:00Z","attachment":{"type":"queued_command","prompt":"ついでに CHANGELOG も","origin":{"kind":"human"}}}',
 ].join('\n')
 
+const focused: string[] = []
+
 const fakeHost = (
   on: On,
   sends: string[],
   tailText = tail,
+  toasts: string[] = [],
 ) => {
   on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/h' : undefined }))
   on('session.id', () => ({ value: SELF }))
   on('session.root', () => ({ value: '/w/repo' }))
   on('clock.now', () => ({ value: NOW }))
-  on('ui.toast', () => ({ value: undefined }))
+  on('ui.toast', (_, e) => {
+    toasts.push(e.text)
+    return { value: undefined }
+  })
   on('fs.read', (_, e) => ({
     value: e.path === '/h/.claude/sessions/11.json' ? '{"bridgeSessionId":"session_ABC"}' : '{}',
   }))
@@ -108,6 +114,11 @@ const fakeHost = (
     if (bin === 'tail') return { value: ok(`truncated…\n${tailText}\n`) }
     return { value: { ...ok(''), exitCode: 127, stderr: `no ${bin}` } }
   })
+  on('ui.focus', (_, e) => {
+    if (e.element) focused.push(e.element)
+    return {}
+  })
+  on('ui.scroll', () => ({}))
   on('session.send', (_, e) => {
     sends.push(`${e.to} ${e.text}`)
     return { isDelivered: true }
@@ -138,9 +149,9 @@ test('このワークスペースのセッションだけを並べ、のぞい�
     expect(await ui.find({ type: 'Button', key: `open:${BG}` })).toBeDefined()
     expect(await ui.find({ type: 'Button', key: `web:${BG}` })).toBeDefined()
 
-    // もう一度押すと畳む
+    // もう一度押しても畳まない (送る欄へ飛ぶ)
     await ui.press({ key: `row:${BG}` })
-    expect(await ui.find({ type: 'Text', text: /README を直して/ })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /README を直して/ })).toBeDefined()
     await ui.unmount()
   }
   expect(sends.length).toBe(0)
@@ -149,10 +160,8 @@ test('このワークスペースのセッションだけを並べ、のぞい�
   for (const surface of ['terminal', 'desktop', 'vscode'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     await ui.press({ key: 'refresh' })
-    await ui.press({ key: `row:${BG}` })
     await ui.input({ key: `send:${BG}:${sends.length}`, text: 'テストを足して' })
     expect(sends.at(-1)).toContain('テストを足して')
-    await ui.press({ key: `row:${BG}` })
     await ui.unmount()
   }
   expect(sends.length).toBe(3)
@@ -185,5 +194,47 @@ test('作業中に届いた依頼を最後の依頼として見せ、返答は�
   await ui.press({ key: `row:${BG}` })
   expect((await ui.find({ type: 'Text', text: /CHANGELOG/ }))?.text).toBe('ついでに CHANGELOG も')
   expect(await ui.find({ type: 'Text', text: /ひとつ前の依頼へ/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('j / k で動き、選んだ行で Enter か i を押しても畳まない', async ($, on) => {
+  const toasts: string[] = []
+  fakeHost(on, [], tail, toasts)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'refresh' })
+  // 開いている行は、その行の「コマンドをコピー」か送る欄で分かる
+  const isOpen = async (id: string) =>
+    (await ui.find({ key: `copy:${id}` })) !== undefined ||
+    (await ui.find({ key: `send:${id}:0` })) !== undefined
+
+  // 並び: 作業中 (新しい順: 自分 → バック) → 待機 (端末) → 過去
+  await ui.press({ key: 'next' })
+  expect(await isOpen(SELF)).toBe(true)
+  await ui.press({ key: 'next' })
+  expect(await isOpen(BG)).toBe(true)
+  expect(await isOpen(SELF)).toBe(false)
+  await ui.press({ key: 'prev' })
+  expect(await isOpen(SELF)).toBe(true)
+  await ui.press({ key: 'next' })
+
+  // 選んでいる行をもう一度 (Enter) / i: 畳まない
+  await ui.press({ key: `row:${BG}` })
+  expect(await isOpen(BG)).toBe(true)
+  await ui.press({ key: 'type' })
+  expect(await isOpen(BG)).toBe(true)
+
+  await ui.press({ key: 'next' })
+  expect(await isOpen(TERM)).toBe(true)
+  await ui.press({ key: 'next' })
+  expect(await isOpen(OLD)).toBe(true)
+  // 送れない行で Enter: 畳まずに知らせるだけ。続けて j で次へ
+  await ui.press({ key: `row:${OLD}` })
+  expect(await isOpen(OLD)).toBe(true)
+  expect(toasts.at(-1)).toMatch(/o で開けます/)
+  await ui.press({ key: 'next' })
+  expect(await isOpen(UNTITLED)).toBe(true)
+  // 端で止まる
+  await ui.press({ key: 'next' })
+  expect(await isOpen(UNTITLED)).toBe(true)
   await ui.unmount()
 })
