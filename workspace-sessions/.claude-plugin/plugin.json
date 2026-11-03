@@ -1,6 +1,6 @@
 {
   "name": "workspace-sessions",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "このワークスペース (リポジトリと worktree) の Claude Code セッションを /ws のペインに並べ、のぞく・開く・送るをその場で",
   "author": { "name": "Pregum" },
   "types": "./types/index.d.ts"

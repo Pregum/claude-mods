@@ -21,6 +21,7 @@ const TERM = 'bbbb2222-0000-0000-0000-000000000000'
 const SELF = 'cccc3333-0000-0000-0000-000000000000'
 const OLD = 'dddd4444-0000-0000-0000-000000000000'
 const SIBLING = 'eeee5555-0000-0000-0000-000000000000'
+const UNTITLED = '99990000-0000-0000-0000-000000000000'
 
 const agents = [
   { pid: 11, id: 'aaaa1111', cwd: '/w/repo', kind: 'background', sessionId: BG, name: 'バックの仕事', status: 'busy', state: 'working', startedAt: NOW - 60_000 },
@@ -38,7 +39,16 @@ const tail = [
 type Ran = { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean; isStderrTruncated: boolean }
 const ok = (stdout: string): Ran => ({ exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false })
 
-const fakeHost = (on: Parameters<Parameters<typeof test>[1]>[1], sends: string[]) => {
+const queuedTail = [
+  tail,
+  '{"type":"attachment","timestamp":"2026-11-03T01:58:00Z","attachment":{"type":"queued_command","prompt":"ついでに CHANGELOG も","origin":{"kind":"human"}}}',
+].join('\n')
+
+const fakeHost = (
+  on: Parameters<Parameters<typeof test>[1]>[1],
+  sends: string[],
+  tailText = tail,
+) => {
   on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/h' : undefined }))
   on('session.id', () => ({ value: SELF }))
   on('session.root', () => ({ value: '/w/repo' }))
@@ -54,7 +64,7 @@ const fakeHost = (on: Parameters<Parameters<typeof test>[1]>[1], sends: string[]
       return { value: [dir('-w-repo'), dir('-w-repo--claude-worktrees-feat'), dir('-w-repo-old'), dir('-x')] }
     }
     if (e.path === `${P}/-w-repo`) {
-      return { value: [file(`${BG}.jsonl`, NOW - 30_000), file(`${SELF}.jsonl`, NOW), file(`${OLD}.jsonl`, NOW - 2 * 86_400_000)] }
+      return { value: [file(`${BG}.jsonl`, NOW - 30_000), file(`${SELF}.jsonl`, NOW), file(`${OLD}.jsonl`, NOW - 2 * 86_400_000), file(`${UNTITLED}.jsonl`, NOW - 3 * 86_400_000)] }
     }
     if (e.path === `${P}/-w-repo--claude-worktrees-feat`) return { value: [file(`${TERM}.jsonl`, NOW - 120_000)] }
     if (e.path === `${P}/-w-repo-old`) return { value: [file(`${SIBLING}.jsonl`, NOW - 1000)] }
@@ -67,11 +77,12 @@ const fakeHost = (on: Parameters<Parameters<typeof test>[1]>[1], sends: string[]
       return { value: ok('worktree /w/repo\nHEAD 1\nbranch refs/heads/main\n\nworktree /w/repo/.claude/worktrees/feat\nHEAD 2\n') }
     }
     if (bin === 'claude' && args[0] === 'agents') return { value: ok(JSON.stringify(agents)) }
-    if (bin === 'grep' && args.includes('-m')) {
+    if (bin === 'grep' && args.includes('-o') && args.includes('-m')) {
       return {
         value: ok(
           [
             `${P}/-w-repo/${OLD}.jsonl:"cwd":"/w/repo"`,
+            `${P}/-w-repo/${UNTITLED}.jsonl:"cwd":"/w/repo"`,
             `${P}/-w-repo/${BG}.jsonl:"cwd":"/w/repo"`,
             `${P}/-w-repo-old/${SIBLING}.jsonl:"cwd":"/w/repo-old"`,
           ].join('\n'),
@@ -81,8 +92,19 @@ const fakeHost = (on: Parameters<Parameters<typeof test>[1]>[1], sends: string[]
     if (bin === 'grep' && args.includes('-o')) {
       return { value: ok(`${P}/-w-repo/${OLD}.jsonl:"aiTitle":"昔の\\"調べもの\\""\n`) }
     }
+    if (bin === 'grep' && args.includes('-m')) {
+      // 題名も履歴も無いもの: 先頭の user 行 (内部の行のあとにスラッシュコマンド)
+      return {
+        value: ok(
+          [
+            `${P}/-w-repo/${UNTITLED}.jsonl:{"type":"user","isMeta":true,"message":{"content":"<local-command-caveat>x</local-command-caveat>"}}`,
+            `${P}/-w-repo/${UNTITLED}.jsonl:{"type":"user","message":{"content":"<command-name>/deploy</command-name><command-args>prod</command-args>"}}`,
+          ].join('\n'),
+        ),
+      }
+    }
     if (bin === 'grep') return { value: { ...ok(''), exitCode: 1 } }
-    if (bin === 'tail') return { value: ok(`truncated…\n${tail}\n`) }
+    if (bin === 'tail') return { value: ok(`truncated…\n${tailText}\n`) }
     return { value: { ...ok(''), exitCode: 127, stderr: `no ${bin}` } }
   })
   on('session.send', (_, e) => {
@@ -104,6 +126,7 @@ test('このワークスペースのセッションだけを並べ、のぞい�
     expect(await ui.find({ type: 'Text', text: /このセッション/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /昔の"調べもの"/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /wt:feat/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /\/deploy prod/ })).toBeDefined()
     // よそのリポジトリ (cwd が外、名前だけ似たフォルダ) は出さない
     expect(await ui.find({ type: 'Text', text: /よその仕事/ })).toBeUndefined()
     expect(await ui.find({ type: 'Text', text: /eeee5555/ })).toBeUndefined()
@@ -144,5 +167,15 @@ test('前の版が残した形の違う値は読まない', async ($, on) => {
   )
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect(await ui.find({ type: 'Text', text: /「更新」で読み込みます/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('作業中に届いた依頼を最後の依頼として見せ、返答はまだと示す', async ($, on) => {
+  fakeHost(on, [], queuedTail)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'refresh' })
+  await ui.press({ key: `row:${BG}` })
+  expect((await ui.find({ type: 'Text', text: /CHANGELOG/ }))?.text).toBe('ついでに CHANGELOG も')
+  expect(await ui.find({ type: 'Text', text: /ひとつ前の依頼へ/ })).toBeDefined()
   await ui.unmount()
 })

@@ -237,6 +237,53 @@ async function firstPrompts(
   return out
 }
 
+/** 人の依頼として読める文か。スラッシュコマンドはその名前と引数で呼ぶ */
+const openerOf = (text: string): string | undefined => {
+  const command = /<command-name>([^<]*)<\/command-name>/.exec(text)?.[1]?.trim()
+  if (command) {
+    const args = /<command-args>([^<]*)<\/command-args>/.exec(text)?.[1]?.trim()
+    return args ? `${command} ${args}` : command
+  }
+  if (text.startsWith('<')) return undefined
+  return text.replace(/\s+/g, ' ').trim() || undefined
+}
+
+/**
+ * 履歴にも残らないもの (`claude -p` や SDK から走らせたもの) は、トランスクリプトの
+ * 最初の依頼で呼ぶ。先頭のいくつかの "type":"user" の行だけを grep で取る
+ */
+async function firstUserTexts(
+  $: Engine,
+  files: readonly string[],
+): Promise<Map<string, string>> {
+  const out = new Map<string, string>()
+  if (files.length === 0) return out
+  try {
+    const ran = await $.process.run(['grep', '-m', '5', '-H', '-F', '"type":"user"', ...files], {
+      timeoutMs: 15000,
+    })
+    for (const line of ran.stdout.split('\n')) {
+      const cut = line.indexOf('.jsonl:')
+      if (cut < 0) continue
+      const path = line.slice(0, cut + '.jsonl'.length)
+      if (out.has(path)) continue
+      let row: Json | undefined
+      try {
+        row = asObject(JSON.parse(line.slice(cut + '.jsonl:'.length)))
+      } catch {
+        continue
+      }
+      if (row?.type !== 'user' || row.isMeta === true) continue
+      const text = textOf(asObject(row.message)?.content)
+      const opener = text ? openerOf(text) : undefined
+      if (opener) out.set(path, opener)
+    }
+  } catch {
+    // 読めなければ id で呼ぶ
+  }
+  return out
+}
+
 const rank = (s: WsSession): number =>
   s.isRunning ? (s.status === 'busy' ? 0 : 1) : s.kind === 'past' ? 3 : 2
 
@@ -316,11 +363,19 @@ export async function collect($: Engine): Promise<WsSnapshot> {
   }
   const untitled = past.filter(one => titleOf(one.file.path) === undefined).map(one => one.id)
   const prompts = await firstPrompts($, home, untitled)
+  const openers = await firstUserTexts(
+    $,
+    past.filter(one => untitled.includes(one.id) && !prompts.has(one.id)).map(one => one.file.path),
+  )
 
   for (const one of past) {
     sessions.push({
       sessionId: one.id,
-      name: titleOf(one.file.path) ?? prompts.get(one.id) ?? one.id.slice(0, 8),
+      name:
+        titleOf(one.file.path) ??
+        prompts.get(one.id) ??
+        openers.get(one.file.path) ??
+        one.id.slice(0, 8),
       cwd: one.cwd,
       place: placeOf(root, one.cwd),
       kind: 'past',
@@ -400,8 +455,12 @@ export async function peek($: Engine, session: WsSession): Promise<WsPeek> {
           if (at === undefined && !Number.isNaN(when)) at = when
         }
       }
-      if (prompt === undefined && row.type === 'user' && asObject(row.origin)?.kind === 'human') {
-        const text = textOf(asObject(row.message)?.content)
+      // 人の依頼: 打ったもの (user) と、作業中に届いて差し込まれたもの (queued_command)
+      const queued = row.type === 'attachment' ? asObject(row.attachment) : undefined
+      const isTyped = row.type === 'user' && asObject(row.origin)?.kind === 'human'
+      const isQueued = queued?.type === 'queued_command' && asObject(queued.origin)?.kind === 'human'
+      if (prompt === undefined && (isTyped || isQueued)) {
+        const text = textOf(isQueued ? queued?.prompt : asObject(row.message)?.content)
         if (text) {
           prompt = text
           promptAt = i
@@ -410,7 +469,8 @@ export async function peek($: Engine, session: WsSession): Promise<WsPeek> {
       }
       if (prompt !== undefined && reply !== undefined) break
     }
-    if (prompt === undefined && reply === undefined && bytes < 3_500_000) continue
+    // 依頼が末尾に入っていなければ (長い作業のあと) 一度だけ広く読み直す
+    if (prompt === undefined && bytes < 3_500_000) continue
     return {
       ...base,
       ...(prompt ? { prompt: clip(prompt, 240) } : {}),
