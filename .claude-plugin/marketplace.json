@@ -1,0 +1,12 @@
+{
+  "name": "pregum-mods",
+  "owner": { "name": "Pregum" },
+  "description": "Pregum の Claude Code の mod 置き場",
+  "plugins": [
+    {
+      "name": "workspace-sessions",
+      "source": "./workspace-sessions",
+      "description": "このワークスペース (リポジトリと worktree) の Claude Code セッションを /ws のペインに並べ、のぞく・開く・送るをその場で"
+    }
+  ]
+}
