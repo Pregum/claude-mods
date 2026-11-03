@@ -22,6 +22,22 @@
 | ↑ (送る欄で) | 送らずに一覧へ戻る |
 | `o` / `c` / `w` | 選んでいる行を 開く / コマンドをコピー / Web で開く |
 | `r` / `p` / `q` | 更新 / 過去をすべて / 閉じる |
+| ctrl+d / ctrl+u | 半ページ下・上へ (詳細を開いて長くなったとき)。PageDown / PageUp も半ページになる |
+
+### ctrl+d / ctrl+u を使うには
+
+キーの割り当ては mod に入れられないので、`~/.claude/keybindings.json` の `Pane` context に足す (ペインにフォーカスがあるときだけ効く。プロンプトでの ctrl+d・ctrl+u はそのまま)。mod はこのペインのページ送りを半ページに縮める。
+
+```json
+{
+  "$schema": "https://www.schemastore.org/claude-code-keybindings.json",
+  "bindings": [
+    { "context": "Pane", "bindings": { "ctrl+d": "pane:pageDown", "ctrl+u": "pane:pageUp" } }
+  ]
+}
+```
+
+ctrl+d は予約キーなのでデバッグログに `"ctrl+d" may not work` と出るが、割り当ては読み込まれる。
 
 ## どこから読んでいるか
 

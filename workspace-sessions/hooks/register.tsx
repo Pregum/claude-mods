@@ -3,6 +3,7 @@ import type { EngineInterface, Register, RenderSurface } from 'claude-code'
 
 import type { WsSession, WsSnapshot } from '../types'
 import { collect, commandFor, copyText, peek } from './collect'
+import { halfPageOffset, isPageMove } from './scroll'
 
 type Engine = EngineInterface
 
@@ -115,6 +116,8 @@ const sendKey = (s: WsSession, n: number): string => `send:${s.sessionId}:${n}`
 // ---- 一覧を読む ----
 
 let inFlight: Promise<void> | undefined
+/** ペインの窓がいま見せている最初の行。描くたびと、動くたびに覚える (半ページ送りの起点) */
+let paneOffset: number | undefined
 
 async function refresh($: Engine): Promise<void> {
   if (inFlight) return inFlight
@@ -339,6 +342,28 @@ export const register: Register = on => {
     return next(e)
   })
 
+  // ページ送り (PageDown / PageUp と、keybindings.json で割り当てた ctrl+d / ctrl+u) を
+  // 半ページに縮める。矢印・ホイール・mod 自身のスクロールはそのまま通す
+  on('ui.scroll', { requestId: PANE }, async ($, e, next) => {
+    const move = {
+      offset: e.offset,
+      by: e.by,
+      bodyRows: e.bodyRows,
+      contentRows: e.contentRows,
+      isPerson: e.origin.kind === 'person',
+    }
+    const last = Math.max(0, e.contentRows - e.bodyRows)
+    if (!isPageMove(move)) {
+      const done = await next(e)
+      paneOffset = Math.min(last, Math.max(0, e.offset))
+      return done
+    }
+    const offset = halfPageOffset(move, paneOffset)
+    const done = await next({ ...e, offset })
+    paneOffset = offset
+    return done
+  })
+
   on('command.run', { command: COMMAND }, async $ => {
     await $.ui.open({ id: PANE, title: 'セッション', focus: true, columns: 60 })
     void refresh($)
@@ -361,6 +386,7 @@ export const register: Register = on => {
     const typingId = await read($, typing)
     const now = await $.clock.now()
     const width = Math.max(24, e.props.bodyColumns)
+    paneOffset = e.props.scroll.offset
 
     const key = (k: string, hotkey: string, label: string, act: () => Promise<void>) => (
       <Button key={k} plain dimColor hotkey={hotkey} label={label} onPress={() => void act()} />
@@ -377,6 +403,7 @@ export const register: Register = on => {
         {key('web', 'w', 'Web', () => onSelected($, s => openWeb($, s)))}
         {key('refresh', 'r', loading ? '更新中…' : '更新', () => refresh($))}
         {key('close', 'q', '閉じる', () => closePane($))}
+        <Text dimColor>^d/^u: 半ページ</Text>
       </Box>
     )
 
