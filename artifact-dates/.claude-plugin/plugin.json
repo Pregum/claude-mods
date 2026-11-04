@@ -1,0 +1,7 @@
+{
+  "name": "artifact-dates",
+  "version": "0.3.0",
+  "description": "Artifact を更新日で分けて並べ、本文をのぞいて、続きを頼む・作った会話へ戻る",
+  "author": { "name": "Pregum" },
+  "types": "./types/index.d.ts"
+}

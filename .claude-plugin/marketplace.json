@@ -1,6 +1,8 @@
 {
   "name": "pregum-mods",
-  "owner": { "name": "Pregum" },
+  "owner": {
+    "name": "Pregum"
+  },
   "description": "Pregum の Claude Code の mod 置き場",
   "plugins": [
     {
@@ -12,6 +14,16 @@
       "name": "where-now",
       "source": "./where-now",
       "description": "計画 todo と、このターンで読んだ・書いたファイルを会話の横のペインに出す「今どこ」"
+    },
+    {
+      "name": "pane-todo",
+      "source": "./pane-todo",
+      "description": "Pane アプリの Todo を会話の横のペインに出し、完了・追加・Claude への依頼をその場で"
+    },
+    {
+      "name": "artifact-dates",
+      "source": "./artifact-dates",
+      "description": "Artifact を更新日で分けて並べ、本文をのぞいて、続きを頼む・作った会話へ戻る"
     }
   ]
 }

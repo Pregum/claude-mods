@@ -1,0 +1,7 @@
+{
+  "name": "pane-todo",
+  "version": "0.2.2",
+  "description": "Pane アプリの Todo を会話の横のペインに出し、完了・追加・Claude への依頼をその場で",
+  "author": { "name": "Pregum" },
+  "types": "./types/index.d.ts"
+}
