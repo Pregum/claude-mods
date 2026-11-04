@@ -34,7 +34,7 @@ const tasks = atom({ plugin: 'where-now', key: 'tasks' } as const, [], { shape: 
 const files = atom({ plugin: 'where-now', key: 'files' } as const, [], { shape: 'files-1' })
 /** マップで選んでいる依頼の番号 (0 始まり)。null はいまの依頼 */
 const picked = atom({ plugin: 'where-now', key: 'picked' } as const, null)
-const sessionMap = atom({ plugin: 'where-now', key: 'map' } as const, null, { shape: 'map-3' })
+const sessionMap = atom({ plugin: 'where-now', key: 'map' } as const, null, { shape: 'map-4' })
 
 // ---- 幅 (全角は 2 マス) ----
 
@@ -196,11 +196,63 @@ const lengthOf = (ms: number): string => {
   return `${Math.floor(hours / 24)}日${hours % 24}時間`
 }
 
+/** Claude Code がプロジェクトのフォルダ名にするときの書き方: 英数字以外は '-' */
+const encodePath = (path: string): string => path.replace(/[^A-Za-z0-9]/g, '-')
+
+/** 人の依頼の行の uuid を、古い順に題名つきで。uuid は会話の行の requestId と同じ */
+const humanRows = (stdout: string): { id: string; text: string }[] =>
+  stdout.split('\n').flatMap(line => {
+    try {
+      const row = JSON.parse(line) as {
+        type?: string
+        uuid?: string
+        origin?: { kind?: string }
+        message?: { content?: unknown }
+      }
+      if (row.type !== 'user' || row.origin?.kind !== 'human' || !row.uuid) return []
+      const content = row.message?.content
+      const text =
+        typeof content === 'string'
+          ? content
+          : Array.isArray(content)
+            ? content.map(block => (block as { text?: string }).text ?? '').join('\n')
+            : ''
+      return [{ id: row.uuid, text: askOf(text) }]
+    } catch {
+      return []
+    }
+  })
+
+/** トランスクリプトから依頼の id を引く。読めなければ id なしのまま (描かれた行だけ飛べる) */
+async function withIds($: Engine, turns: readonly WnTurn[]): Promise<WnTurn[]> {
+  try {
+    const home = (await $.env.get('HOME')) ?? ''
+    const id = await $.session.id()
+    const dirs = [...new Set([await $.session.root(), await $.session.cwd()])].map(encodePath)
+    for (const dir of dirs) {
+      const path = `${home}/.claude/projects/${dir}/${id}.jsonl`
+      const ran = await $.process.run(['grep', '-F', '"kind":"human"', path], { timeoutMs: 10000 })
+      if (ran.exitCode !== 0) continue
+      const rows = humanRows(ran.stdout)
+      let from = 0
+      return turns.map(turn => {
+        const at = rows.findIndex((row, i) => i >= from && row.text === turn.text)
+        if (at < 0) return turn
+        from = at + 1
+        return { ...turn, id: rows[at]?.id ?? '' }
+      })
+    }
+  } catch {
+    // 下で id なしのまま返す
+  }
+  return [...turns]
+}
+
 async function refreshMap($: Engine): Promise<void> {
   try {
     const [messages, usage] = await Promise.all([$.session.messages(), $.session.usage()])
     const map: WnMap = {
-      turns: turnsOf(messages),
+      turns: await withIds($, turnsOf(messages)),
       startedAt: usage.startedAt,
       ...(usage.context.percent !== undefined ? { percent: usage.context.percent } : {}),
     }
@@ -238,23 +290,27 @@ async function movePick($: Engine, by: number): Promise<void> {
   await update($, picked, () => (next === map.turns.length - 1 ? null : next))
 }
 
-/** 選んでいる依頼の行へ会話をスクロールする */
-async function jump($: Engine, at: number): Promise<void> {
-  const map = await read($, sessionMap)
-  const turn = map?.turns[at]
-  if (!map || !turn) return
-  const same = map.turns.slice(0, at).filter(one => one.text === turn.text).length
-  const id = rowIds.get(turn.text)?.[same]
+/**
+ * 依頼の行へ会話をスクロールする。会話の行は人の操作に答えている間しか動かないので、
+ * 押された処理の中で同期的に呼ぶ (await を挟むと not person-initiated で断られる)
+ */
+const jump = ($: Engine, turns: readonly WnTurn[], at: number): void => {
+  const turn = turns[at]
+  if (!turn) return
+  const same = turns.slice(0, at).filter(one => one.text === turn.text).length
+  const id = turn.id ?? rowIds.get(turn.text)?.[same]
   if (!id) {
-    $.ui.toast('この依頼の行はまだ描かれていません。会話を一度そこまでスクロールすると飛べます')
+    $.ui.toast('この依頼の場所が分かりませんでした')
     return
   }
-  try {
-    const moved = await $.ui.scroll({ to: { requestId: id }, block: 'start' })
-    if ('deny' in moved && moved.deny) $.ui.toast(`飛べませんでした: ${moved.deny}`)
-  } catch (err) {
-    $.ui.toast(`飛べませんでした: ${err instanceof Error ? err.message : String(err)}`)
-  }
+  void $.ui
+    .scroll({ to: { requestId: id }, block: 'start' })
+    .then(moved => {
+      if ('deny' in moved && moved.deny) $.ui.toast(`飛べませんでした: ${moved.deny}`)
+    })
+    .catch((err: unknown) => {
+      $.ui.toast(`飛べませんでした: ${err instanceof Error ? err.message : String(err)}`)
+    })
 }
 
 /** 本体のコマンドへ渡す。途中の地点からの fork は mod から呼べないので /rewind と /branch を使う */
@@ -270,7 +326,8 @@ async function runCommand($: Engine, command: string): Promise<void> {
 
 async function openPane($: Engine): Promise<void> {
   await $.store.delete(CLOSED)
-  await $.ui.open({ id: PANE, title: TITLE })
+  // プロンプトが空のときだけ通る。/where の直後は空なのでキーが移る
+  await $.ui.open({ id: PANE, title: TITLE, focus: true })
 }
 
 async function closePane($: Engine): Promise<void> {
@@ -278,10 +335,13 @@ async function closePane($: Engine): Promise<void> {
   await $.ui.close({ id: PANE })
 }
 
-/** /where: 出ていれば閉じ、出ていなければ開く。幅待ちのペインは出ていないので開く */
+/**
+ * /where: 出ていなければ開き、出ていてキーが無ければキーを渡す。キーを持っていれば閉じる。
+ * 幅待ちのペインは出ていないので開く
+ */
 async function togglePane($: Engine): Promise<void> {
   const pane = (await $.ui.panes()).find(one => one.id === PANE)
-  await (pane?.isPlaced ? closePane($) : openPane($))
+  await (pane?.isPlaced && pane.isFocused ? closePane($) : openPane($))
 }
 
 // ---- フック ----
@@ -290,7 +350,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: COMMAND,
-      description: '「今どこ」ペインを開く・閉じる',
+      description: '「今どこ」ペインを開いてキーを渡す。キーがあれば閉じる',
     })
     // 手で閉じていたら開かない。頼まれずに開くペインは幅が足りるまで待つ
     if (!(await $.store.get(CLOSED))) void $.ui.open({ id: PANE, title: TITLE })
@@ -489,7 +549,12 @@ export const register: Register = on => {
       const tail = ` ${String(turn.weight - 1).padStart(3)}`
       const room = Math.max(4, width - cells(head) - cells(tail) - 2)
       return (
-        <Button key={`turn:${index}`} plain onPress={() => void jump($, index)}>
+        <Button
+          key={`turn:${index}`}
+          plain
+          {...(isHere ? { autoFocus: true as const } : {})}
+          onPress={() => jump($, data.turns, index)}
+        >
           <Text bold={isHere}>{head}</Text>
           <Text {...(color ? { color } : { dimColor: true })}>{'▌ '}</Text>
           <Text bold={isHere}>{padTo(fit(turn.text, room), room)}</Text>
@@ -503,11 +568,11 @@ export const register: Register = on => {
       return data.turns.slice(start, start + RECENT).map((turn, i) => turnRow(data, turn, start + i))
     }
 
-    const mapKeys = () => (
+    const mapKeys = (data: WnMap) => (
       <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
         <Button key="prev" plain dimColor hotkey="k" label="前" onPress={() => void movePick($, -1)} />
         <Button key="next" plain dimColor hotkey="j" label="次" onPress={() => void movePick($, 1)} />
-        <Button key="jump" plain dimColor hotkey="g" label="飛ぶ" onPress={() => void jump($, at)} />
+        <Button key="jump" plain dimColor hotkey="g" label="飛ぶ" onPress={() => jump($, data.turns, at)} />
         <Button key="rewind" plain dimColor hotkey="r" label="巻き戻す" onPress={() => void runCommand($, 'rewind')} />
         <Button key="branch" plain dimColor hotkey="b" label="今から分岐" onPress={() => void runCommand($, 'branch')} />
       </Box>
@@ -546,7 +611,7 @@ export const register: Register = on => {
         {map && map.turns.length > 0 && legend()}
         {map && map.percent !== undefined && gauge(map.percent)}
         {map && map.turns.length > 0 && shownTurns(map)}
-        {map && map.turns.length > 0 && mapKeys()}
+        {map && map.turns.length > 0 && mapKeys(map)}
         {asked !== '' && <Text bold>{fit(asked, width)}</Text>}
         <Text dimColor>{`─ 計画${plan.length > 0 ? ` ${doneCount}/${plan.length}` : ''}`}</Text>
         {plan.length === 0 && <Text dimColor>計画はありません</Text>}

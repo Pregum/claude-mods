@@ -24,6 +24,8 @@ export type WnFile = {
 export type TurnKind = 'edit' | 'run' | 'read' | 'agent' | 'talk'
 
 export type WnTurn = {
+  /** 依頼の行の id。トランスクリプトから引けなければ無し */
+  id?: string
   text: string
   kind: TurnKind
   /** 依頼 1 + ツールの呼び出し数 */

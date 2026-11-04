@@ -33,13 +33,19 @@ const NO_USAGE = { startedAt: 0, context: { window: 1 }, rateLimits: [] }
 const host = (
   on: On,
   answer: (e: { tool: string }) => unknown = () => ({ result: {} }),
-  { now = 0, messages = [] as unknown[], usage = NO_USAGE as unknown } = {},
+  { now = 0, messages = [] as unknown[], usage = NO_USAGE as unknown, transcript = undefined as string | undefined } = {},
 ) => {
   withStore(on)
   on('session.root', () => ({ value: '/w/repo' }))
   on('clock.now', () => ({ value: now }))
   on('session.messages', () => ({ value: messages as never }))
   on('session.usage', () => ({ value: usage as never }))
+  on('env.get', () => ({ value: '/h' }))
+  on('session.id', () => ({ value: 'sid' }))
+  on('session.cwd', () => ({ value: '/w/repo' }))
+  on('process.run', () => ({
+    value: { exitCode: transcript === undefined ? 1 : 0, stdout: transcript ?? '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+  }))
   on('turn.complete', () => ({}) as never)
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('tool.call', (_, e) => answer(e) as never)
@@ -147,38 +153,49 @@ test('前の版が残した形の違う値は読まない', async ($, on) => {
 
 const pane = (isPlaced: boolean) => ({ id: 'where-now', title: '今どこ', isShown: isPlaced, isFocused: false, isPlaced })
 
-test('/where は出ていれば閉じ、出ていなければ開く。閉じたら次の開始では開かない', async ($, on) => {
-  let shown = false
-  const seen = { opened: 0, closed: 0 }
+test('/where は開いてキーを渡し、開いていてもキーを渡し、キーがあれば閉じる。閉じたら次の開始では開かない', async ($, on) => {
+  let state = { shown: false, focused: false }
+  const opens: (true | undefined)[] = []
+  let closes = 0
   withStore(on)
   on('session.root', () => ({ value: '/w/repo' }))
   on('command.register', () => ({ value: { command: 'where' } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.messages', () => ({ value: [] }))
-  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1 }, rateLimits: [] } }))
-  on('ui.panes', () => ({ value: shown ? [pane(true)] : [] }))
-  on('ui.open', () => {
-    shown = true
-    seen.opened += 1
+  on('session.usage', () => ({ value: NO_USAGE as never }))
+  on('ui.panes', () => ({
+    value: state.shown ? [{ ...pane(true), isFocused: state.focused }] : [],
+  }))
+  on('ui.open', (_, e) => {
+    state = { shown: true, focused: e.focus === true }
+    opens.push(e.focus)
     return { value: { isPlaced: true } }
   })
   on('ui.close', () => {
-    shown = false
-    seen.closed += 1
+    state = { shown: false, focused: false }
+    closes += 1
     return { value: undefined }
   })
-  const where = () => $.command.run({ command: 'where', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  const where = () =>
+    $.command.run({ command: 'where', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  const start = () => $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
 
+  // セッションの開始で開くペインは、プロンプトからキーを奪わない
+  await start()
+  expect(opens).toEqual([undefined])
+  // 開いているがキーが無い: 閉じずにキーを渡す
   await where()
-  expect(seen).toEqual({ opened: 1, closed: 0 })
+  expect(opens).toEqual([undefined, true])
+  expect(closes).toBe(0)
+  // キーがあれば閉じる
   await where()
-  expect(seen).toEqual({ opened: 1, closed: 1 })
-  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  expect(seen.opened).toBe(1)
+  expect(closes).toBe(1)
+  await start()
+  expect(opens).toHaveLength(2)
   await where()
-  expect(seen.opened).toBe(2)
-  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  expect(seen.opened).toBe(3)
+  expect(opens).toEqual([undefined, true, true])
+  await start()
+  expect(opens).toHaveLength(4)
 })
 
 test('q で閉じる', async ($, on) => {
@@ -233,32 +250,28 @@ const JUMP_MESSAGES = [
   { role: 'user', text: '直して', toolUses: [] },
 ]
 
-test('描かれた依頼の行へ飛ぶ。描かれていなければ知らせる', async ($, on) => {
+const human = (uuid: string, content: unknown) =>
+  JSON.stringify({ type: 'user', uuid, origin: { kind: 'human' }, message: { content } })
+
+test('トランスクリプトの uuid か、描かれた行の id で依頼へ飛ぶ。どちらも無ければ知らせる', async ($, on) => {
   const toasts: string[] = []
-  host(on, undefined, { messages: JUMP_MESSAGES })
-  on('ui.render', { component: 'UserMessage' }, ($, e) => {
-    const { Text } = $.ui.resolve(e)
-    return <Text>row</Text>
+  host(on, undefined, {
+    messages: JUMP_MESSAGES,
+    // 1 件目は uuid で引ける。2 件目は文が違い、id なしのまま
+    transcript: [human('u1', [{ type: 'text', text: '調べて' }]), human('u2', '別の文')].join('\n'),
   })
   on('ui.toast', (_, e) => {
     toasts.push(e.text)
     return { value: undefined }
   })
   await $.turn.start({ text: '直して', turnId: 't' })
-  const row = await $.ui.mount({
-    plugin: 'engine',
-    component: 'UserMessage',
-    requestId: 'row-1',
-    surface: 'terminal',
-    props: { text: '調べて', origin: { kind: 'human' }, isExpanded: false },
-  } as never)
-  await row.unmount()
-
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await ui.press({ key: 'jump' })
-  expect(toasts.at(-1)).toMatch(/まだ描かれていません/)
+  expect(toasts.at(-1)).toMatch(/場所が分かりませんでした/)
   // テストの engine には会話の行が無いので、id が引けて scroll まで届いたことを見る
   await ui.press({ key: 'turn:0' })
+  // scroll の答えは press のあとで届く
+  for (let i = 0; i < 20 && !/飛べませんでした/.test(toasts.at(-1) ?? ''); i += 1) await ui.find({ type: 'Text' })
   expect(toasts.at(-1)).toMatch(/飛べませんでした/)
   await ui.unmount()
 })
