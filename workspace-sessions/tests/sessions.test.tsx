@@ -15,6 +15,8 @@ const PANE = {
   },
 } as const
 
+const VIEW = { ...PANE, requestId: 'workspace-sessions-view' } as const
+
 const NOW = Date.parse('2026-11-03T02:00:00Z')
 const P = '/h/.claude/projects'
 const BG = 'aaaa1111-0000-0000-0000-000000000000'
@@ -47,7 +49,17 @@ const ok = (stdout: string): Ran => ({ exitCode: 0, stdout, stderr: '', isStdout
 
 /** エンジンの代わり。何が起きたかを返す */
 const fakeHost = (on: On, tailText = tail) => {
-  const seen = { sends: [] as string[], toasts: [] as string[], copies: [] as string[], closed: [] as string[] }
+  const seen = {
+    sends: [] as string[],
+    toasts: [] as string[],
+    copies: [] as string[],
+    closed: [] as string[],
+    opened: [] as { id: string; columns?: number; rows?: number; focus?: true; closeOnEscape?: true }[],
+  }
+  on('ui.open', (_, e) => {
+    seen.opened.push({ id: e.id, columns: e.columns, rows: e.rows, focus: e.focus, closeOnEscape: e.closeOnEscape })
+    return { value: { isPlaced: true } }
+  })
   on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/h' : undefined }))
   on('session.id', () => ({ value: SELF }))
   on('session.root', () => ({ value: '/w/repo' }))
@@ -152,6 +164,60 @@ test('このワークスペースのセッションだけを並べる', async ($
   }
 })
 
+test('/ws はエンジンが許す最大の幅と高さを頼んで開き、広い本文に合わせて描く', async ($, on) => {
+  const seen = fakeHost(on)
+  await $.command.run({
+    command: 'ws',
+    args: '',
+    origin: { kind: 'composer' },
+    presentation: { isFullscreen: true, columns: 200 },
+  })
+  expect(seen.opened[0]).toMatchObject({ id: 'workspace-sessions', columns: 1000, rows: 1000, focus: true })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 200 } })
+  await ui.press({ key: 'refresh' })
+  expect(await ui.find({ type: 'Text', text: /バックの仕事/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('o で一覧と入れ替えて会話を見せ、q で一覧へ戻る', async ($, on) => {
+  const seen = fakeHost(on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'refresh' })
+  await ui.press({ key: `row:${BG}` })
+  await ui.press({ key: 'open' })
+  await ui.unmount()
+  expect(seen.closed).toEqual(['workspace-sessions'])
+  expect(seen.opened.at(-1)).toMatchObject({
+    id: 'workspace-sessions-view',
+    focus: true,
+    closeOnEscape: true,
+    columns: 1000,
+  })
+
+  const view = await $.ui.mount({ ...VIEW, surface: 'terminal' })
+  expect(await view.find({ type: 'Text', text: /❯ README を直して/ })).toBeDefined()
+  expect(await view.find({ type: 'Markdown', text: /README を直しました/ })).toBeDefined()
+  expect(await view.find({ key: 'elsewhere' })).toBeDefined()
+  await view.press({ key: 'back' })
+  expect(seen.closed.at(-1)).toBe('workspace-sessions-view')
+  expect(seen.opened.at(-1)).toMatchObject({ id: 'workspace-sessions', focus: true })
+  await view.unmount()
+})
+
+test('端末で動いているセッションは a を出さず、o でも Web を開かない', async ($, on) => {
+  const seen = fakeHost(on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'refresh' })
+  await ui.press({ key: `row:${TERM}` })
+  await ui.press({ key: 'open' })
+  await ui.unmount()
+  expect(seen.opened.at(-1)?.id).toBe('workspace-sessions-view')
+  const view = await $.ui.mount({ ...VIEW, surface: 'terminal' })
+  expect(await view.find({ key: 'elsewhere' })).toBeUndefined()
+  await view.unmount()
+})
+
 test('j / k で動いても詳細は広がらず、d で開け閉めし、開いたままなら移った先を出す', async ($, on) => {
   const seen = fakeHost(on)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
@@ -197,39 +263,42 @@ test('j / k で動いても詳細は広がらず、d で開け閉めし、開い
   await ui.unmount()
 })
 
-test('Enter か i で送る欄が出て、送ると消える。移動しても消える', async ($, on) => {
+test('Enter か i で表示ペインの送る欄へ進み、送っても続けて打てる', async ($, on) => {
   const seen = fakeHost(on)
   for (const surface of ['terminal', 'desktop', 'vscode'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     await ui.press({ key: 'refresh' })
-    await ui.press({ key: `row:${BG}` })
-    const n = seen.sends.length
-    expect(await ui.find({ key: `send:${BG}:${n}` })).toBeUndefined()
-
-    await ui.press({ key: `row:${BG}` }) // 選んでいる行で Enter
-    expect(await ui.find({ key: `send:${BG}:${n}` })).toBeDefined()
-    await ui.input({ key: `send:${BG}:${n}`, text: 'テストを足して' })
-    expect(seen.sends.at(-1)).toContain('テストを足して')
-    expect(await ui.find({ key: `send:${BG}:${n + 1}` })).toBeUndefined()
-
-    await ui.press({ key: 'type' }) // i
-    expect(await ui.find({ key: `send:${BG}:${n + 1}` })).toBeDefined()
     await ui.press({ key: 'next' })
-    expect(await ui.find({ key: `send:${BG}:${n + 1}` })).toBeUndefined()
+    await ui.press({ key: `row:${BG}` }) // 選んでいなければ選ぶだけ
+    await ui.press({ key: `row:${BG}` }) // 選んでいる行で Enter
     await ui.unmount()
+    expect(seen.opened.at(-1)).toMatchObject({ id: 'workspace-sessions-view', closeOnEscape: true })
+
+    const n = seen.sends.length
+    const view = await $.ui.mount({ ...VIEW, surface })
+    await view.input({ key: `send:${BG}:${n}`, text: 'テストを足して' })
+    expect(seen.sends.at(-1)).toContain('テストを足して')
+    expect(await view.find({ key: `send:${BG}:${n + 1}` })).toBeDefined()
+    await view.unmount()
+    seen.opened.length = 0
   }
   expect(seen.sends.length).toBe(3)
 })
 
 test('mobile には送る欄も i も無い', async ($, on) => {
-  fakeHost(on)
+  const seen = fakeHost(on)
   const ui = await $.ui.mount({ ...PANE, surface: 'mobile' })
   await ui.press({ key: 'refresh' })
   expect(await ui.find({ type: 'Button', key: 'type' })).toBeUndefined()
   await ui.press({ key: `row:${BG}` })
   await ui.press({ key: `row:${BG}` })
-  expect(await ui.find({ key: `send:${BG}:0` })).toBeUndefined()
+  expect(seen.opened).toEqual([])
+  await ui.press({ key: 'open' })
   await ui.unmount()
+  const view = await $.ui.mount({ ...VIEW, surface: 'mobile' })
+  expect(await view.find({ type: 'Button', key: 'type' })).toBeUndefined()
+  expect(await view.find({ key: `send:${BG}:0` })).toBeUndefined()
+  await view.unmount()
 })
 
 test('自分自身には送る欄を出さず、開くも止める', async ($, on) => {
@@ -238,10 +307,10 @@ test('自分自身には送る欄を出さず、開くも止める', async ($, o
   await ui.press({ key: 'refresh' })
   await ui.press({ key: `row:${SELF}` })
   await ui.press({ key: 'type' })
-  expect(await ui.find({ key: `send:${SELF}:0` })).toBeUndefined()
   expect(seen.toasts.at(-1)).toMatch(/いま見ている/)
   await ui.press({ key: 'open' })
   expect(seen.toasts.at(-1)).toMatch(/いま見ている/)
+  expect(seen.opened).toEqual([])
   await ui.unmount()
 })
 

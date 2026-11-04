@@ -1,11 +1,14 @@
 import type { EngineInterface } from 'claude-code'
 
-import type { WsPeek, WsSession, WsSnapshot } from '../types'
+import type { WsConvo, WsPeek, WsSession, WsSnapshot, WsTurn } from '../types'
 
 type Engine = EngineInterface
 
 /** 過去のトランスクリプトを何件まで並べるか */
 const PAST_LIMIT = 30
+/** 表示ペインに出す発言の数と、1 発言の長さ */
+const TURN_LIMIT = 16
+const TURN_CHARS = 4000
 
 /** Claude Code がプロジェクトのフォルダ名にするときの書き方: 英数字以外は '-' */
 export const encodePath = (path: string): string =>
@@ -483,6 +486,49 @@ export async function peek($: Engine, session: WsSession): Promise<WsPeek> {
 }
 
 /** 開くためのコマンド。端末で対話中のものは別の端末にいるので無し */
+/** トランスクリプトの末尾から、人の依頼と返答の文を古い順に */
+export async function conversation($: Engine, session: WsSession): Promise<WsConvo> {
+  const base = { sessionId: session.sessionId, turns: [] }
+  if (!session.transcript) return { ...base, error: 'トランスクリプトがありません' }
+  for (const bytes of [400_000, 3_500_000]) {
+    let stdout: string
+    try {
+      const ran = await $.process.run(['tail', '-c', String(bytes), session.transcript], {
+        timeoutMs: 10000,
+      })
+      if (ran.exitCode !== 0) return { ...base, error: ran.stderr.trim() || 'まだ何も書かれていません' }
+      stdout = ran.stdout
+    } catch (err) {
+      return { ...base, error: message(err) }
+    }
+    const turns: WsTurn[] = []
+    for (const line of stdout.split('\n')) {
+      if (line[0] !== '{') continue
+      let row: Json | undefined
+      try {
+        row = asObject(JSON.parse(line))
+      } catch {
+        continue // tail で切れた先頭の行
+      }
+      if (!row || row.isSidechain === true) continue
+      const queued = row.type === 'attachment' ? asObject(row.attachment) : undefined
+      const isTyped = row.type === 'user' && asObject(row.origin)?.kind === 'human'
+      const isQueued = queued?.type === 'queued_command' && asObject(queued.origin)?.kind === 'human'
+      const content = isQueued ? queued?.prompt : asObject(row.message)?.content
+      const role = isTyped || isQueued ? 'you' : row.type === 'assistant' ? 'claude' : undefined
+      const text = role ? textOf(content) : undefined
+      if (!role || !text) continue
+      const turn = { role, text: clip(text, TURN_CHARS) } as const
+      const last = turns.at(-1)
+      if (last?.role !== turn.role || last.text !== turn.text) turns.push(turn)
+    }
+    if (turns.length >= TURN_LIMIT || stdout.length < bytes) {
+      return { ...base, turns: turns.slice(-TURN_LIMIT) }
+    }
+  }
+  return { ...base, error: 'トランスクリプトが読めませんでした' }
+}
+
 export const commandFor = (session: WsSession): string | undefined => {
   if (session.kind === 'past') return `claude --resume ${session.sessionId}`
   if (session.kind === 'background') return `claude attach ${session.shortId ?? session.sessionId.slice(0, 8)}`

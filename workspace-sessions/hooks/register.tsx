@@ -1,16 +1,25 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderSurface } from 'claude-code'
 
-import type { WsSession, WsSnapshot } from '../types'
-import { collect, commandFor, copyText, peek } from './collect'
+import type { WsConvo, WsSession, WsSnapshot } from '../types'
+import { collect, commandFor, conversation, copyText, peek } from './collect'
 import { halfPageOffset, isPageMove } from './scroll'
 
 type Engine = EngineInterface
 
 const PANE = 'workspace-sessions'
+/** 一覧と入れ替えて出す、ひとつのセッションの表示。Esc で一覧へ戻る */
+const VIEW = 'workspace-sessions-view'
 const COMMAND = 'ws'
+// ペインを全画面にする口はエンジンに無い。多めに頼み、許される最大で開く
+// (ドックは端末の 45% まで、インラインは配置が許す高さまで)
+const MAX_COLUMNS = 1000
+const MAX_ROWS = 1000
+const SIZE = { columns: MAX_COLUMNS, rows: MAX_ROWS }
 /** ペインが開いている間、一覧を描き直す間隔 */
 const EVERY_MS = 20_000
+/** 表示ペインが開いている間、会話を読み直す間隔 */
+const VIEW_EVERY_MS = 5_000
 /** 「過去」を畳んでいるときに見せる件数 */
 const PAST_FOLDED = 5
 
@@ -26,7 +35,13 @@ const peeked = atom({ plugin: 'workspace-sessions', key: 'peek' } as const, null
 const showAll = atom({ plugin: 'workspace-sessions', key: 'showAll' } as const, false)
 const sent = atom({ plugin: 'workspace-sessions', key: 'sent' } as const, 0)
 const showDetail = atom({ plugin: 'workspace-sessions', key: 'showDetail' } as const, false)
-const typing = atom({ plugin: 'workspace-sessions', key: 'typing' } as const, null)
+const viewing = atom({ plugin: 'workspace-sessions', key: 'viewing' } as const, null, {
+  shape: 'session-1',
+})
+const convo = atom({ plugin: 'workspace-sessions', key: 'convo' } as const, null, {
+  shape: 'convo-1',
+})
+const composing = atom({ plugin: 'workspace-sessions', key: 'composing' } as const, false)
 
 const message = (err: unknown): string => (err instanceof Error ? err.message : String(err))
 
@@ -102,6 +117,13 @@ const metaOf = (s: WsSession, now: number): string =>
 
 const canSend = (s: WsSession): boolean => s.isRunning && !s.isSelf
 
+const LIST = { ...SIZE, id: PANE, title: 'セッション', focus: true } as const
+
+const isSameConvo = (a: WsConvo, b: WsConvo): boolean =>
+  a.error === b.error &&
+  a.turns.length === b.turns.length &&
+  a.turns.every((turn, i) => turn.text === b.turns[i]?.text)
+
 /** いま並んでいる順 (畳んだ過去は数えない): j / k はこの順に動く */
 const visibleOf = (snap: WsSnapshot | null, all: boolean): WsSession[] => {
   if (!snap) return []
@@ -141,9 +163,9 @@ async function refresh($: Engine): Promise<void> {
   return inFlight
 }
 
-async function isPaneOpen($: Engine): Promise<boolean> {
+async function isPaneOpen($: Engine, id: string): Promise<boolean> {
   try {
-    return (await $.ui.panes()).some(pane => pane.id === PANE)
+    return (await $.ui.panes()).some(pane => pane.id === id)
   } catch {
     return false
   }
@@ -175,7 +197,6 @@ async function loadPeek($: Engine, s: WsSession): Promise<void> {
 /** 選ぶ。行の下には何も広げない (詳細は d で開いているときだけ) */
 async function select($: Engine, s: WsSession): Promise<void> {
   await update($, selected, () => s.sessionId)
-  await update($, typing, () => null)
   if (await read($, showDetail)) await loadPeek($, s)
 }
 
@@ -200,18 +221,77 @@ async function toggleDetail($: Engine): Promise<void> {
   if (s && (await read($, showDetail))) await loadPeek($, s)
 }
 
-/** Enter / i: その行の下に送る欄を出して、フォーカスをそこへ */
+/** 会話を読み直す。新しい発言があれば末尾まで送る */
+async function loadConvo($: Engine, s: WsSession): Promise<void> {
+  const loaded = await conversation($, s)
+  const cur = await read($, convo)
+  if ((await read($, viewing))?.sessionId !== s.sessionId) return
+  if (cur && !cur.isLoading && isSameConvo(cur, loaded)) return
+  await update($, convo, () => loaded)
+  await $.ui.scroll({ in: VIEW, to: 'end' }).catch(() => undefined)
+}
+
+/**
+ * 一覧を閉じてから表示ペインを開く。ペインがキーを持ったままだと、開いたペインは
+ * 前に出ずフォーカスも渡らないので入れ替える。プロンプトに文字があると focus は通らない
+ */
+async function openView($: Engine, s: WsSession): Promise<void> {
+  await update($, viewing, () => s)
+  await update($, convo, () => ({ sessionId: s.sessionId, isLoading: true, turns: [] }))
+  await $.ui.close({ id: PANE }).catch(() => undefined)
+  await $.ui.open({
+    ...SIZE,
+    id: VIEW,
+    title: s.name.slice(0, 40),
+    focus: true,
+    closeOnEscape: true,
+  })
+  await loadConvo($, s)
+}
+
+/** 表示ペインの片付けと、一覧を開き直してキーを渡すところ。Esc と閉じる印は ui.close のフックから */
+async function returnToList($: Engine): Promise<void> {
+  await update($, viewing, () => null)
+  await update($, convo, () => null)
+  await update($, composing, () => false)
+  await $.ui.open(LIST).catch(() => undefined)
+  void refresh($)
+}
+
+/** q: mod から閉じただけでは一覧が戻らないので、ここで戻す */
+async function closeView($: Engine): Promise<void> {
+  await $.ui.close({ id: VIEW }).catch(() => undefined)
+  await returnToList($)
+}
+
+/** 送る欄を出して、フォーカスをそこへ */
+async function compose($: Engine, s: WsSession): Promise<void> {
+  await update($, composing, () => true)
+  await ring($, sendKey(s, await read($, sent)))
+}
+
+/** o: 一覧の場所で、そのセッションの会話を見る */
+async function viewSession($: Engine, s: WsSession): Promise<void> {
+  if (s.isSelf) {
+    $.ui.toast('いま見ているセッションです')
+    return
+  }
+  await openView($, s)
+}
+
+/** Enter / i: 表示ペインを開いて、送る欄へ */
 async function typeInto($: Engine, s: WsSession, surface: RenderSurface): Promise<void> {
   if (!canSend(s)) {
-    $.ui.toast(s.isSelf ? 'いま見ているセッションです' : '止まっているので送れません。o で開けます')
+    $.ui.toast(s.isSelf ? 'いま見ているセッションです' : '止まっているので送れません。o で見られます')
     return
   }
   if (surface === 'mobile') {
     $.ui.toast('この画面には入力欄がありません')
     return
   }
-  await update($, typing, () => s.sessionId)
-  await ring($, sendKey(s, await read($, sent)))
+  // 開く前に立てる: 開いた直後はまだキーを持たず、最初の描画の autoFocus でだけ入れる
+  await update($, composing, () => true)
+  await openView($, s)
 }
 
 /** 行を押す (Enter・数字): 選ぶ。もう選んでいる行なら、送れるものは送る欄へ、送れないものは詳細の開け閉め */
@@ -268,14 +348,11 @@ async function cmuxBin($: Engine): Promise<string | undefined> {
   return (await $.env.get('CMUX_SOCKET_PATH')) ? 'cmux' : undefined
 }
 
-async function openSession($: Engine, s: WsSession, surface: RenderSurface): Promise<void> {
-  if (s.isSelf) {
-    $.ui.toast('いま見ているセッションです')
-    return
-  }
+/** a: 本物のセッションを別の場所で開く。端末で動いているものは開けないので知らせる */
+async function openElsewhere($: Engine, s: WsSession, surface: RenderSurface): Promise<void> {
   const command = commandFor(s)
   if (!command) {
-    await openWeb($, s)
+    await copyCommand($, s, surface)
     return
   }
   const cmux = await cmuxBin($)
@@ -316,14 +393,10 @@ async function sendTo($: Engine, s: WsSession, text: string): Promise<void> {
     return
   }
   await update($, sent, n => n + 1)
-  await update($, typing, () => null)
   $.ui.toast(`送りました → ${s.name}`)
-  // 一覧に戻す: 続けて j / k で動ける
-  await ring($, rowKey(s))
 }
 
 async function closePane($: Engine): Promise<void> {
-  await update($, typing, () => null)
   await $.ui.close({ id: PANE }).catch(() => undefined)
 }
 
@@ -337,53 +410,143 @@ export const register: Register = on => {
     })
     // 開いている間だけ描き直す。モジュールが読み直されるとタイマーも作り直される
     $.clock.every(EVERY_MS, () => {
-      void isPaneOpen($).then(open => (open ? refresh($) : undefined))
+      void isPaneOpen($, PANE).then(open => (open ? refresh($) : undefined))
+    })
+    $.clock.every(VIEW_EVERY_MS, () => {
+      void (async () => {
+        const s = await read($, viewing)
+        if (s && (await isPaneOpen($, VIEW))) await loadConvo($, s)
+      })()
     })
     return next(e)
   })
 
   // ページ送り (PageDown / PageUp と、keybindings.json で割り当てた ctrl+d / ctrl+u) を
   // 半ページに縮める。矢印・ホイール・mod 自身のスクロールはそのまま通す
-  on('ui.scroll', { requestId: PANE }, async ($, e, next) => {
-    const move = {
-      offset: e.offset,
-      by: e.by,
-      bodyRows: e.bodyRows,
-      contentRows: e.contentRows,
-      isPerson: e.origin.kind === 'person',
-    }
-    const last = Math.max(0, e.contentRows - e.bodyRows)
-    if (!isPageMove(move)) {
-      const done = await next(e)
-      paneOffset = Math.min(last, Math.max(0, e.offset))
+  for (const requestId of [PANE, VIEW]) {
+    on('ui.scroll', { requestId }, async ($, e, next) => {
+      const move = {
+        offset: e.offset,
+        by: e.by,
+        bodyRows: e.bodyRows,
+        contentRows: e.contentRows,
+        isPerson: e.origin.kind === 'person',
+      }
+      const last = Math.max(0, e.contentRows - e.bodyRows)
+      if (!isPageMove(move)) {
+        const done = await next(e)
+        paneOffset = Math.min(last, Math.max(0, e.offset))
+        return done
+      }
+      const offset = halfPageOffset(move, paneOffset)
+      const done = await next({ ...e, offset })
+      paneOffset = offset
       return done
-    }
-    const offset = halfPageOffset(move, paneOffset)
-    const done = await next({ ...e, offset })
-    paneOffset = offset
+    })
+  }
+
+  on('command.run', { command: COMMAND }, async $ => {
+    // 表示ペインが残っていれば、閉じて一覧へ
+    if (await isPaneOpen($, VIEW)) await closeView($)
+    else await $.ui.open(LIST)
+    void refresh($)
+    return {}
+  })
+
+  // Esc・q・閉じる印のどれで閉じても、一覧へ戻ってキーも渡す
+  on('ui.close', { id: VIEW }, async ($, e, next) => {
+    const done = await next(e)
+    await returnToList($)
     return done
   })
 
-  on('command.run', { command: COMMAND }, async $ => {
-    await $.ui.open({ id: PANE, title: 'セッション', focus: true, columns: 60 })
-    void refresh($)
-    return {}
+  on('ui.render', { component: 'Pane', requestId: VIEW }, async ($, e) => {
+    const els = $.ui.resolve(e)
+    const { Box, Text, Button, Markdown } = els
+    const Input = e.surface !== 'mobile' && 'Input' in els ? els.Input : undefined
+
+    const stored = await read($, viewing)
+    const snap = await read($, snapshot)
+    const data = await read($, convo)
+    const sentCount = await read($, sent)
+    const isComposing = await read($, composing)
+    const now = await $.clock.now()
+    const width = Math.max(24, e.props.bodyColumns)
+    paneOffset = e.props.scroll.offset
+
+    const key = (k: string, hotkey: string, label: string, act: () => Promise<void>) => (
+      <Button key={k} plain dimColor hotkey={hotkey} label={label} onPress={() => void act()} />
+    )
+    // 手に取れる要素が無いとペインはキーを持たず、打ったものがプロンプトへ流れる
+    const back = (
+      <Button
+        key="back"
+        plain
+        dimColor
+        {...(isComposing ? {} : { autoFocus: true as const })}
+        hotkey="q"
+        label="一覧へ (Esc)"
+        onPress={() => void closeView($)}
+      />
+    )
+    if (!stored) return <Box flexDirection="column">{back}</Box>
+
+    const s = snap?.sessions.find(item => item.sessionId === stored.sessionId) ?? stored
+    const canType = Boolean(Input) && canSend(s)
+    return (
+      <Box flexDirection="column">
+        <Text bold>{fit(s.name, width)}</Text>
+        <Text dimColor>{fit(metaOf(s, now), width)}</Text>
+        {data?.isLoading && <Text dimColor>読み込み中…</Text>}
+        {data?.error && <Text dimColor>{data.error}</Text>}
+        {data && !data.isLoading && !data.error && data.turns.length === 0 && (
+          <Text dimColor>まだ発言がありません</Text>
+        )}
+        {data?.turns.map((turn, i) => (
+          <Box key={`turn:${i}`} flexDirection="row" marginTop={1}>
+            {turn.role === 'you' ? (
+              <Text color="claude" bold>{`❯ ${turn.text}`}</Text>
+            ) : (
+              <Markdown text={turn.text} />
+            )}
+          </Box>
+        ))}
+        <Box flexDirection="row" flexWrap="wrap" columnGap={2} marginTop={1}>
+          {back}
+          {canType && !isComposing && key('type', 'i', '打つ', () => compose($, s))}
+          {commandFor(s) && key('elsewhere', 'a', '別で開く', () => openElsewhere($, s, e.surface))}
+          {key('copy', 'c', 'コピー', () => copyCommand($, s, e.surface))}
+          {key('web', 'w', 'Web', () => openWeb($, s))}
+          {key('refresh', 'r', '更新', () => loadConvo($, s))}
+          <Text dimColor>^d/^u: 半ページ</Text>
+        </Box>
+        {canType && isComposing && Input && (
+          // 送るたびに key が変わって作り直され、autoFocus で続けて打てる
+          <Input
+            key={sendKey(s, sentCount)}
+            label="送る "
+            placeholder="打って Enter で送る (Esc で一覧へ)"
+            submitLabel="送る"
+            autoFocus
+            onSubmit={value => void sendTo($, s, value)}
+          />
+        )}
+      </Box>
+    )
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const els = $.ui.resolve(e)
     const { Box, Text, Button } = els
     // mobile には入力欄が無い (表に名前があっても描けない)
-    const Input = e.surface !== 'mobile' && 'Input' in els ? els.Input : undefined
+    const hasInput = e.surface !== 'mobile' && 'Input' in els
 
     const snap = await read($, snapshot)
     const loading = await read($, isLoading)
     const chosen = await read($, selected)
     const seen = await read($, peeked)
     const all = await read($, showAll)
-    const sentCount = await read($, sent)
     const isDetailed = await read($, showDetail)
-    const typingId = await read($, typing)
     const now = await $.clock.now()
     const width = Math.max(24, e.props.bodyColumns)
     paneOffset = e.props.scroll.offset
@@ -397,8 +560,8 @@ export const register: Register = on => {
         {key('next', 'j', '次', () => move($, 1))}
         {key('prev', 'k', '前', () => move($, -1))}
         {key('detail', 'd', isDetailed ? '詳細を閉じる' : '詳細', () => toggleDetail($))}
-        {Input && key('type', 'i', '打つ', () => onSelected($, s => typeInto($, s, e.surface)))}
-        {key('open', 'o', '開く', () => onSelected($, s => openSession($, s, e.surface)))}
+        {hasInput && key('type', 'i', '打つ', () => onSelected($, s => typeInto($, s, e.surface)))}
+        {key('open', 'o', '見る', () => onSelected($, s => viewSession($, s)))}
         {key('copy', 'c', 'コピー', () => onSelected($, s => copyCommand($, s, e.surface)))}
         {key('web', 'w', 'Web', () => onSelected($, s => openWeb($, s)))}
         {key('refresh', 'r', loading ? '更新中…' : '更新', () => refresh($))}
@@ -467,18 +630,6 @@ export const register: Register = on => {
             <Text dimColor>{meta}</Text>
           </Button>
           {isHere && isDetailed && detail(s)}
-          {isHere && typingId === s.sessionId && canSend(s) && Input && (
-            <Box paddingLeft={4}>
-              <Input
-                key={sendKey(s, sentCount)}
-                label="送る "
-                placeholder="打って Enter で送る (↑ で一覧へ)"
-                submitLabel="送る"
-                autoFocus
-                onSubmit={value => void sendTo($, s, value)}
-              />
-            </Box>
-          )}
         </Box>
       )
     }
