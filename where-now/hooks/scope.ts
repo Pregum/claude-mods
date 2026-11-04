@@ -22,6 +22,7 @@ const DEFAULT = 0x01000000
 const UPPER_HALF = 0x2580
 const LOWER_HALF = 0x2584
 const FULL_BLOCK = 0x2588
+const RIGHT_LINE = 0x2595
 
 export const hex = (color: number): string => `#${color.toString(16).padStart(6, '0')}`
 
@@ -128,12 +129,18 @@ export const scopeCells = ({ turns, at, columns, rows, pulse, reveal }: ScopeFra
 const gaugeColorAt = (t: number): number =>
   t < 0.6 ? mix(COLORS.edit, COLORS.run, t / 0.6) : mix(COLORS.run, 0xf85149, (t - 0.6) / 0.4)
 
-export const gaugeCells = (percent: number, columns: number): string => {
+/** hasLimit なら右端に compact の走る地点の線を引く */
+export const gaugeCells = (percent: number, columns: number, hasLimit = false): string => {
   const words = new Uint32Array(columns * 3)
   const used = (percent / 100) * columns
   for (let x = 0; x < columns; x += 1) {
-    words[x * 3] = LOWER_HALF
-    words[x * 3 + 1] = x < used ? gaugeColorAt(x / Math.max(1, columns - 1)) : GAUGE_REST
+    const isLimit = hasLimit && x === columns - 1
+    words[x * 3] = isLimit ? RIGHT_LINE : LOWER_HALF
+    words[x * 3 + 1] = isLimit
+      ? gaugeColorAt(1)
+      : x < used
+        ? gaugeColorAt(x / Math.max(1, columns - 1))
+        : GAUGE_REST
     words[x * 3 + 2] = DEFAULT
   }
   return toCells(words)

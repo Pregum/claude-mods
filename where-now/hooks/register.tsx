@@ -39,7 +39,7 @@ const tasks = atom({ plugin: 'where-now', key: 'tasks' } as const, [], { shape: 
 const files = atom({ plugin: 'where-now', key: 'files' } as const, [], { shape: 'files-1' })
 /** マップで選んでいる依頼の番号 (0 始まり)。null はいまの依頼 */
 const picked = atom({ plugin: 'where-now', key: 'picked' } as const, null)
-const sessionMap = atom({ plugin: 'where-now', key: 'map' } as const, null, { shape: 'map-5' })
+const sessionMap = atom({ plugin: 'where-now', key: 'map' } as const, null, { shape: 'map-6' })
 
 // ---- 幅 (全角は 2 マス) ----
 
@@ -227,11 +227,18 @@ async function withIds($: Engine, turns: readonly WnTurn[]): Promise<WnTurn[]> {
 
 async function refreshMap($: Engine): Promise<void> {
   try {
-    const [messages, usage] = await Promise.all([$.session.messages(), $.session.usage()])
+    // summary は手元の推定だけで済み、API へのリクエストは出ない
+    const [messages, usage] = await Promise.all([
+      $.session.messages(),
+      $.session.usage({ breakdown: 'summary' }),
+    ])
+    const tokens = usage.context.tokens
+    const threshold = usage.context.breakdown?.autoCompactThreshold
     const map: WnMap = {
       turns: await withIds($, turnsOf(messages)),
       startedAt: usage.startedAt,
       ...(usage.context.percent !== undefined ? { percent: usage.context.percent } : {}),
+      ...(tokens !== undefined && threshold ? { compact: { tokens, threshold } } : {}),
     }
     await update($, sessionMap, () => map)
   } catch {
@@ -601,23 +608,31 @@ export const register: Register = on => {
       </Box>
     )
 
-    /** コンテキストをどれだけ使ったか。色は位置で決まり、右へ進むほど赤い */
-    const gauge = (percent: number) => {
-      const label = '文脈 '
-      const tail = ` ${percent}%`
+    /**
+     * 自動 compact までどれだけ進んだか。右端が compact の走る地点で、右へ進むほど赤い。
+     * 自動 compact が切れているときは、ウィンドウの使用率を出す
+     */
+    const gauge = (data: WnMap) => {
+      const limit = data.compact
+      const percent = limit
+        ? Math.min(100, Math.round((limit.tokens / limit.threshold) * 100))
+        : (data.percent ?? 0)
+      const label = limit ? 'compact ' : '文脈 '
+      const left = limit ? limit.threshold - limit.tokens : 0
+      const tail = ` ${percent}%${limit ? (left > 0 ? ` あと${Math.round(left / 1000)}k` : ' まもなく') : ''}`
       const room = Math.min(GAUGE_WIDTH, Math.max(4, width - cells(label) - cells(tail)))
       if (Raster) {
         return (
           <Box flexDirection="row">
             <Text dimColor>{label}</Text>
-            <Raster key="gauge" columns={room} rows={1} cells={gaugeCells(percent, room)} />
+            <Raster key="gauge" columns={room} rows={1} cells={gaugeCells(percent, room, limit !== undefined)} />
             <Text bold>{tail}</Text>
           </Box>
         )
       }
       const used = Math.min(room, Math.round((percent / 100) * room))
       return (
-        <Text dimColor>{`${label}${'█'.repeat(used)}${'░'.repeat(room - used)}${tail}`}</Text>
+        <Text dimColor>{`${label}${'█'.repeat(used)}${'░'.repeat(room - used)}${limit ? '▕' : ''}${tail}`}</Text>
       )
     }
 
@@ -698,7 +713,7 @@ export const register: Register = on => {
         {map && map.turns.length > 0 && scope(map)}
         {map && map.turns.length > 0 && ruler(map)}
         {map && map.turns.length > 0 && legend(map)}
-        {map && map.percent !== undefined && gauge(map.percent)}
+        {map && (map.compact || map.percent !== undefined) && gauge(map)}
         <Text> </Text>
         {map && map.turns.length > 0 && shownTurns(map)}
         {map && map.turns.length > 0 && mapKeys(map)}

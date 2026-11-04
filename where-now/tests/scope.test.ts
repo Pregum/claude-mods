@@ -53,6 +53,12 @@ test('ゲージは使った分だけ色がつき、残りは同じ灰色', () =>
   expect(cells[5 * 3 + 1]).toBe(cells[9 * 3 + 1])
 })
 
+test('compact の地点があるときは右端に線を引く', () => {
+  const cells = words(gaugeCells(10, 10, true))
+  expect(cells[9 * 3]).toBe(0x2595)
+  expect(words(gaugeCells(10, 10))[9 * 3]).toBe(0x2584)
+})
+
 test('脈は 0〜1 を行き来し、色の混ぜ方は端で元の色になる', () => {
   expect(pulseAt(300) > 0.99).toBe(true)
   expect(pulseAt(900) < 0.01).toBe(true)

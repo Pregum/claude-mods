@@ -256,6 +256,25 @@ test('ミニマップは人の依頼ごとの重さとセッションの長さ�
   await ui.unmount()
 })
 
+test('ゲージは自動 compact の地点までの進みを出す', async ($, on) => {
+  host(on, undefined, {
+    usage: {
+      startedAt: 0,
+      rateLimits: [],
+      context: { window: 200_000, tokens: 80_000, percent: 40, breakdown: { autoCompactThreshold: 160_000 } },
+    },
+  })
+  await $.turn.start({ text: '依頼', turnId: 't' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /compact .*▕ 50% あと80k/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /文脈/ })).toBeUndefined()
+  await ui.unmount()
+  const term = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await term.find({ type: 'Raster', key: 'gauge' })).toBeDefined()
+  expect(await term.find({ type: 'Text', text: /^ 50% あと80k$/ })).toBeDefined()
+  await term.unmount()
+})
+
 const JUMP_MESSAGES = [
   { role: 'user', text: '調べて', toolUses: [] },
   { role: 'assistant', text: '済み', toolUses: [{ tool: 'Grep' }] },

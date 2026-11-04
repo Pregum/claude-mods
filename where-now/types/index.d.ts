@@ -40,8 +40,10 @@ export type WnTurn = {
 export type WnMap = {
   turns: WnTurn[]
   startedAt: number
-  /** コンテキストの使用率。最初の返答までは無し */
+  /** コンテキストウィンドウの使用率。最初の返答までは無し */
   percent?: number
+  /** 使用トークン数と、自動 compact が走るトークン数。自動 compact が切れていれば無し */
+  compact?: { tokens: number; threshold: number }
 }
 
 declare module 'claude-code' {
