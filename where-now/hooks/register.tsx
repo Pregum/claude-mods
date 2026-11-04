@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { TaskStatus, TurnKind, WnCount, WnFile, WnMap, WnTask, WnTools, WnTurn } from '../types'
-import { COLORS, gaugeCells, hex, pulseAt, railCells, scopeCells } from './scope'
+import { COLORS, gaugeCells, hex, layoutFor, pulseAt, railCells, scopeCells } from './scope'
 import { shellKind } from './shell'
 
 type Engine = EngineInterface
@@ -15,8 +15,8 @@ const FILE_LIMIT = 200
 const CLOSED = 'closed'
 const BARS = '▁▂▃▄▅▆▇█'
 /** 題名つきで並べる依頼の数 */
-const RECENT = 5
-const SCOPE_ROWS = 4
+/** 上に出るときに頼む高さ。横に出るときは効かない */
+const WANTED_ROWS = 22
 const GAUGE_WIDTH = 40
 /** 選んでいる依頼の詳しい欄に並べる数 */
 const DETAIL_TOOLS = 6
@@ -201,6 +201,15 @@ const barOf = (weight: number, max: number): string =>
 
 const colorOf = (kind: TurnKind): string => hex(COLORS[kind])
 
+/** 選んでいる依頼の詳しい欄が取る行数 */
+const detailRowsOf = (turn: WnTurn): number =>
+  turn.weight === 1
+    ? 0
+    : (turn.names.length > 0 ? 1 : 0) +
+      (turn.servers.length > 0 ? 1 : 0) +
+      Math.min(turn.edits.length, DETAIL_FILES) +
+      (turn.edits.length > DETAIL_FILES ? 1 : 0)
+
 /** Bash は中身で分かれるので、名前だけのときは実行の色 */
 const toolColor = (tool: string): TurnKind => toolKind(tool, undefined)
 
@@ -368,7 +377,9 @@ async function runCommand($: Engine, command: string): Promise<void> {
  * blit に渡す今の絵。描くたびに描画が更新する。モジュールの変数なので読み直しで消えるが、
  * 次の描画で戻る。Raster の無い画面では undefined のまま
  */
-let live: { turns: readonly WnTurn[]; at: number; columns: number; isFocused: boolean } | undefined
+let live:
+  | { turns: readonly WnTurn[]; at: number; columns: number; rows: number; isFocused: boolean }
+  | undefined
 /** あと何コマ、選んでいる行へフォーカスの帯を合わせ直すか */
 let refocus = 0
 /** 登場の始まり。動いていなければ undefined */
@@ -386,7 +397,8 @@ async function tick($: Engine): Promise<void> {
     refocus -= 1
     const key = `turn:${frame.at}`
     await $.ui.focus({ requestId: PANE, key }).catch(() => undefined)
-    await $.ui.scroll({ in: PANE, to: { key } }).catch(() => undefined)
+    // 依頼の一覧は高さに収めてあるので、全体マップが見える先頭に戻す
+    await $.ui.scroll({ in: PANE, to: 'start' }).catch(() => undefined)
   }
   const now = await $.clock.now()
   const reveal = revealOf(now)
@@ -396,8 +408,8 @@ async function tick($: Engine): Promise<void> {
   await blit(
     'scope',
     frame.columns,
-    SCOPE_ROWS,
-    scopeCells({ turns: frame.turns, at: frame.at, columns: frame.columns, rows: SCOPE_ROWS, pulse, reveal }),
+    frame.rows,
+    scopeCells({ turns: frame.turns, at: frame.at, columns: frame.columns, rows: frame.rows, pulse, reveal }),
   )
   const turn = frame.turns[frame.at]
   if (turn) await blit('rail', 1, 1, railCells(COLORS[turn.kind], pulse))
@@ -409,7 +421,7 @@ async function tick($: Engine): Promise<void> {
 async function openPane($: Engine): Promise<void> {
   await $.store.delete(CLOSED)
   // プロンプトが空のときだけ通る。/where の直後は空なのでキーが移る
-  await $.ui.open({ id: PANE, title: TITLE, focus: true })
+  await $.ui.open({ id: PANE, title: TITLE, focus: true, rows: WANTED_ROWS })
   revealFrom = await $.clock.now()
   refocus = REFOCUS_FRAMES
 }
@@ -438,7 +450,7 @@ export const register: Register = on => {
       description: '「今どこ」ペインを開いてキーを渡す。キーがあれば閉じる',
     })
     // 手で閉じていたら開かない。頼まれずに開くペインは幅が足りるまで待つ
-    if (!(await $.store.get(CLOSED))) void $.ui.open({ id: PANE, title: TITLE })
+    if (!(await $.store.get(CLOSED))) void $.ui.open({ id: PANE, title: TITLE, rows: WANTED_ROWS })
     $.clock.every(FRAME_MS, () => void tick($))
     const done = await next(e)
     await refreshMap($)
@@ -595,7 +607,11 @@ export const register: Register = on => {
 
     const isFocused = e.props.isFocused
     const scopeWidth = Math.min(512, width)
-    live = map && Raster ? { turns: map.turns, at, columns: scopeWidth, isFocused } : undefined
+    const pickedTurn = map?.turns[at]
+    const detailRows = pickedTurn ? detailRowsOf(pickedTurn) : 0
+    const fits = layoutFor(e.props.scroll.bodyRows, detailRows, width < 52 ? 2 : 1)
+    const scopeRows = fits.scopeRows
+    live = map && Raster ? { turns: map.turns, at, columns: scopeWidth, rows: scopeRows, isFocused } : undefined
     const pulse = isFocused ? pulseAt(now) : 0
 
     const toolCount = (turn: WnTurn) => turn.weight - 1
@@ -631,12 +647,12 @@ export const register: Register = on => {
           <Raster
             key="scope"
             columns={scopeWidth}
-            rows={SCOPE_ROWS}
+            rows={scopeRows}
             cells={scopeCells({
               turns: data.turns,
               at,
               columns: scopeWidth,
-              rows: SCOPE_ROWS,
+              rows: scopeRows,
               pulse,
               reveal: revealOf(now),
             })}
@@ -776,8 +792,8 @@ export const register: Register = on => {
     }
 
     const shownTurns = (data: WnMap) => {
-      const start = Math.max(0, Math.min(at - Math.floor(RECENT / 2), data.turns.length - RECENT))
-      return data.turns.slice(start, start + RECENT).map((turn, i) => turnRow(data, turn, start + i))
+      const start = Math.max(0, Math.min(at - Math.floor(fits.recent / 2), data.turns.length - fits.recent))
+      return data.turns.slice(start, start + fits.recent).map((turn, i) => turnRow(data, turn, start + i))
     }
 
     const mapKeys = (data: WnMap) => (
@@ -820,14 +836,14 @@ export const register: Register = on => {
       <Box flexDirection="column">
         {map && header(map)}
         {map && map.turns.length > 0 && scope(map)}
-        {map && map.turns.length > 0 && ruler(map)}
-        {map && map.turns.length > 0 && detail(map)}
-        {map && map.turns.length > 0 && legend(map)}
-        {map && (map.compact || map.percent !== undefined) && gauge(map)}
-        <Text> </Text>
+        {map && map.turns.length > 0 && fits.hasRuler && ruler(map)}
+        {map && map.turns.length > 0 && fits.hasDetail && detail(map)}
+        {map && map.turns.length > 0 && fits.hasLegend && legend(map)}
+        {map && fits.hasGauge && (map.compact || map.percent !== undefined) && gauge(map)}
+        {fits.hasGaps && <Text> </Text>}
         {map && map.turns.length > 0 && shownTurns(map)}
         {map && map.turns.length > 0 && mapKeys(map)}
-        <Text> </Text>
+        {fits.hasGaps && <Text> </Text>}
         <Text dimColor>{`─ 計画${plan.length > 0 ? ` ${'▰'.repeat(doneCount)}${'▱'.repeat(plan.length - doneCount)} ${doneCount}/${plan.length}` : ''}`}</Text>
         {plan.length === 0 && <Text dimColor>計画はありません</Text>}
         {plan.map(taskRow)}

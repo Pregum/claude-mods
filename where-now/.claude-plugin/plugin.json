@@ -1,6 +1,6 @@
 {
   "name": "where-now",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "計画 todo と、このターンで読んだ・書いたファイルを会話の横のペインに出す「今どこ」",
   "author": {
     "name": "Pregum"

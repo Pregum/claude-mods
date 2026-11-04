@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import type { WnTurn } from '../types'
-import { columnsOf, gaugeCells, mix, pulseAt, railCells, scopeCells } from '../hooks/scope'
+import { columnsOf, gaugeCells, layoutFor, mix, pulseAt, railCells, scopeCells } from '../hooks/scope'
 import { shellKind } from '../hooks/shell'
 
 const turn = (edit: number, read: number): WnTurn => ({
@@ -80,4 +80,43 @@ test('Bash はコマンドの中身で分ける', () => {
   expect(shellKind('git push origin main')).toBe('run')
   expect(shellKind('claude plugin test .')).toBe('run')
   expect(shellKind('./deploy.sh')).toBe('run')
+})
+
+const usedRows = (bodyRows: number, detailRows: number, keyRows: number) => {
+  const fit = layoutFor(bodyRows, detailRows, keyRows)
+  return (
+    1 +
+    fit.scopeRows +
+    fit.recent +
+    keyRows +
+    (fit.hasRuler ? 1 : 0) +
+    (fit.hasGauge ? 1 : 0) +
+    (fit.hasLegend ? 1 : 0) +
+    (fit.hasDetail ? detailRows : 0) +
+    (fit.hasGaps ? 2 : 0)
+  )
+}
+
+test('どの高さでも、全体マップが押し出されないよう行数は高さに収まる', () => {
+  for (let rows = 7; rows <= 50; rows += 1) {
+    for (const detail of [0, 1, 3, 6]) {
+      expect(usedRows(rows, detail, 1) <= rows).toBe(true)
+    }
+  }
+})
+
+test('狭いときは全体マップを縮めて残し、広いときは全部出す', () => {
+  const tight = layoutFor(8, 3, 1)
+  expect(tight.scopeRows).toBe(2)
+  expect(tight.recent).toBe(3)
+  expect(tight.hasLegend).toBe(false)
+  expect(layoutFor(30, 3, 1)).toEqual({
+    scopeRows: 4,
+    recent: 5,
+    hasRuler: true,
+    hasGauge: true,
+    hasLegend: true,
+    hasDetail: true,
+    hasGaps: true,
+  })
 })

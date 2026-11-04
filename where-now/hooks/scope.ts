@@ -156,3 +156,44 @@ export const pulseAt = (ms: number): number => {
   const wave = (Math.sin((ms / 1200) * Math.PI * 2) + 1) / 2
   return wave * wave
 }
+
+export type PaneLayout = {
+  scopeRows: number
+  recent: number
+  hasRuler: boolean
+  hasGauge: boolean
+  hasLegend: boolean
+  hasDetail: boolean
+  hasGaps: boolean
+}
+
+/**
+ * 高さに収める。見出し・全体マップ・依頼の一覧・キーは必ず残し、余った行を大事な順に足す。
+ * 収まらないと選んだ行を見せるスクロールで全体マップが押し出される
+ */
+export const layoutFor = (bodyRows: number, detailRows: number, keyRows: number): PaneLayout => {
+  const layout: PaneLayout = {
+    scopeRows: 2,
+    recent: 3,
+    hasRuler: false,
+    hasGauge: false,
+    hasLegend: false,
+    hasDetail: false,
+    hasGaps: false,
+  }
+  let left = bodyRows - (1 + layout.scopeRows + layout.recent + keyRows)
+  const take = (rows: number, apply: () => void): void => {
+    if (left < rows) return
+    left -= rows
+    apply()
+  }
+  take(1, () => (layout.hasRuler = true))
+  take(1, () => (layout.hasGauge = true))
+  take(1, () => (layout.scopeRows = 3))
+  take(2, () => (layout.recent = 5))
+  take(1, () => (layout.scopeRows = 4))
+  take(1, () => (layout.hasLegend = true))
+  if (detailRows > 0) take(detailRows, () => (layout.hasDetail = true))
+  take(2, () => (layout.hasGaps = true))
+  return layout
+}
