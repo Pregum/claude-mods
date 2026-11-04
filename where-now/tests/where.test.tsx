@@ -15,8 +15,32 @@ const PANE = {
   },
 } as const
 
-const host = (on: On, answer: (e: { tool: string }) => unknown = () => ({ result: {} })) => {
+const withStore = (on: On) => {
+  const kept = new Map<string, unknown>()
+  on('store.get', (_, e) => ({ value: kept.get(e.key) }))
+  on('store.set', (_, e) => {
+    kept.set(e.key, e.value)
+    return { value: undefined }
+  })
+  on('store.delete', (_, e) => {
+    kept.delete(e.key)
+    return { value: undefined }
+  })
+}
+
+const NO_USAGE = { startedAt: 0, context: { window: 1 }, rateLimits: [] }
+
+const host = (
+  on: On,
+  answer: (e: { tool: string }) => unknown = () => ({ result: {} }),
+  { now = 0, messages = [] as unknown[], usage = NO_USAGE as unknown } = {},
+) => {
+  withStore(on)
   on('session.root', () => ({ value: '/w/repo' }))
+  on('clock.now', () => ({ value: now }))
+  on('session.messages', () => ({ value: messages as never }))
+  on('session.usage', () => ({ value: usage as never }))
+  on('turn.complete', () => ({}) as never)
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('tool.call', (_, e) => answer(e) as never)
 }
@@ -112,10 +136,144 @@ test('長いパスはファイル名を残して切る', async ($, on) => {
 
 test('前の版が残した形の違う値は読まない', async ($, on) => {
   on('session.root', () => ({ value: '/w/repo' }))
+  on('clock.now', () => ({ value: 0 }))
   on('state.get', (_, e, next) =>
     e.key === 'files' ? { value: { value: [{ path: 1 }], version: 1 } } : next(e),
   )
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: /まだ触っていません/ })).toBeDefined()
+  await ui.unmount()
+})
+
+const pane = (isPlaced: boolean) => ({ id: 'where-now', title: '今どこ', isShown: isPlaced, isFocused: false, isPlaced })
+
+test('/where は出ていれば閉じ、出ていなければ開く。閉じたら次の開始では開かない', async ($, on) => {
+  let shown = false
+  const seen = { opened: 0, closed: 0 }
+  withStore(on)
+  on('session.root', () => ({ value: '/w/repo' }))
+  on('command.register', () => ({ value: { command: 'where' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.messages', () => ({ value: [] }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1 }, rateLimits: [] } }))
+  on('ui.panes', () => ({ value: shown ? [pane(true)] : [] }))
+  on('ui.open', () => {
+    shown = true
+    seen.opened += 1
+    return { value: { isPlaced: true } }
+  })
+  on('ui.close', () => {
+    shown = false
+    seen.closed += 1
+    return { value: undefined }
+  })
+  const where = () => $.command.run({ command: 'where', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+
+  await where()
+  expect(seen).toEqual({ opened: 1, closed: 0 })
+  await where()
+  expect(seen).toEqual({ opened: 1, closed: 1 })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  expect(seen.opened).toBe(1)
+  await where()
+  expect(seen.opened).toBe(2)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  expect(seen.opened).toBe(3)
+})
+
+test('q で閉じる', async ($, on) => {
+  const closed: string[] = []
+  host(on)
+  on('ui.close', (_, e) => {
+    closed.push(e.id)
+    return { value: undefined }
+  })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'close' })
+  expect(closed).toEqual(['where-now'])
+  await ui.unmount()
+})
+
+test('ミニマップは人の依頼ごとの重さとセッションの長さを出し、差し込まれた文は数えない', async ($, on) => {
+  host(on, undefined, {
+    now: 90 * 60_000,
+    usage: { startedAt: 0, context: { window: 100, tokens: 43, percent: 43 }, rateLimits: [] },
+    messages: [
+      { role: 'user', text: '一つ目', toolUses: [] },
+      { role: 'assistant', text: '', toolUses: [{ tool: 'Edit' }, { tool: 'Bash' }, { tool: 'Read' }, { tool: 'Read' }, { tool: 'Read' }, { tool: 'Read' }, { tool: 'Read' }] },
+      { role: 'user', text: '', toolUses: [], toolResults: [{}] },
+      { role: 'user', text: '<system-reminder>x</system-reminder>', toolUses: [] },
+      { role: 'assistant', text: '済み', toolUses: [] },
+      { role: 'user', text: '二つ目', toolUses: [] },
+      { role: 'assistant', text: '済み', toolUses: [] },
+    ],
+  })
+  await $.turn.start({ text: '二つ目', turnId: 't' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /セッション · 1時間30分/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /依頼 2/ })).toBeDefined()
+  // 帯: 色が分類、高さが重さ
+  const edit = await ui.find({ type: 'Text', text: /^█$/ })
+  expect(edit?.props?.color).toBe('success')
+  expect(await ui.find({ type: 'Text', text: /^■編集$/ })).toBeDefined()
+  // ゲージ: 幅 24 の 43% は 10 マス
+  expect((await ui.find({ type: 'Text', text: /^█{10}$/ }))?.text).toHaveLength(10)
+  // 選んでいる依頼のまわり: いまの依頼から始まる
+  expect(await ui.find({ type: 'Text', text: /^›2 $/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^ 1 $/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^ +7$/ })).toBeDefined()
+  await ui.press({ key: 'prev' })
+  expect(await ui.find({ type: 'Text', text: /^›1 $/ })).toBeDefined()
+  await ui.unmount()
+})
+
+const JUMP_MESSAGES = [
+  { role: 'user', text: '調べて', toolUses: [] },
+  { role: 'assistant', text: '済み', toolUses: [{ tool: 'Grep' }] },
+  { role: 'user', text: '直して', toolUses: [] },
+]
+
+test('描かれた依頼の行へ飛ぶ。描かれていなければ知らせる', async ($, on) => {
+  const toasts: string[] = []
+  host(on, undefined, { messages: JUMP_MESSAGES })
+  on('ui.render', { component: 'UserMessage' }, ($, e) => {
+    const { Text } = $.ui.resolve(e)
+    return <Text>row</Text>
+  })
+  on('ui.toast', (_, e) => {
+    toasts.push(e.text)
+    return { value: undefined }
+  })
+  await $.turn.start({ text: '直して', turnId: 't' })
+  const row = await $.ui.mount({
+    plugin: 'engine',
+    component: 'UserMessage',
+    requestId: 'row-1',
+    surface: 'terminal',
+    props: { text: '調べて', origin: { kind: 'human' }, isExpanded: false },
+  } as never)
+  await row.unmount()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'jump' })
+  expect(toasts.at(-1)).toMatch(/まだ描かれていません/)
+  // テストの engine には会話の行が無いので、id が引けて scroll まで届いたことを見る
+  await ui.press({ key: 'turn:0' })
+  expect(toasts.at(-1)).toMatch(/飛べませんでした/)
+  await ui.unmount()
+})
+
+test('巻き戻すと今から分岐は本体のコマンドへ渡す', async ($, on) => {
+  const ran: string[] = []
+  host(on, undefined, { messages: JUMP_MESSAGES })
+  on('command.run', (_, e) => {
+    ran.push(e.command)
+    return {}
+  })
+  await $.turn.start({ text: '直して', turnId: 't' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'rewind' })
+  await ui.press({ key: 'branch' })
+  expect(ran).toEqual(['rewind', 'branch'])
   await ui.unmount()
 })

@@ -20,6 +20,24 @@ export type WnFile = {
   isSubOnly: boolean
 }
 
+/** 依頼で主に何をしたか */
+export type TurnKind = 'edit' | 'run' | 'read' | 'agent' | 'talk'
+
+export type WnTurn = {
+  text: string
+  kind: TurnKind
+  /** 依頼 1 + ツールの呼び出し数 */
+  weight: number
+}
+
+/** セッション全体の長さ */
+export type WnMap = {
+  turns: WnTurn[]
+  startedAt: number
+  /** コンテキストの使用率。最初の返答までは無し */
+  percent?: number
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'where-now': {
@@ -28,6 +46,9 @@ declare module 'claude-code' {
       tasks: Shaped<WnTask[]>
       /** このターンで触ったファイル。最後に触ったものが先頭 */
       files: Shaped<WnFile[]>
+      map: Shaped<WnMap | null>
+      /** マップで選んでいる依頼の番号。null はいまの依頼 */
+      picked: number | null
     }
   }
 }
