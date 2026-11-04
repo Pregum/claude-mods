@@ -7,6 +7,11 @@
       "name": "workspace-sessions",
       "source": "./workspace-sessions",
       "description": "このワークスペース (リポジトリと worktree) の Claude Code セッションを /ws のペインに並べ、のぞく・開く・送るをその場で"
+    },
+    {
+      "name": "where-now",
+      "source": "./where-now",
+      "description": "計画 todo と、このターンで読んだ・書いたファイルを会話の横のペインに出す「今どこ」"
     }
   ]
 }

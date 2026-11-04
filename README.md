@@ -5,10 +5,11 @@ Pregum の Claude Code の mod 置き場。リポジトリ全体がひとつの 
 | mod | 何をするか |
 | --- | --- |
 | [workspace-sessions](./workspace-sessions) | `/ws` で、いまのワークスペース (リポジトリと worktree) のセッションを並べ、のぞく・開く・送る |
+| [where-now](./where-now) | 計画 todo と、このターンで読んだ・書いたファイルを会話の横のペインに出す |
 
 ## 入れ方
 
-ターミナルの Claude Code のプロンプトで:
+ターミナルの Claude Code のプロンプトで (`where-now` も同じ):
 
 ```
 /plugin install workspace-sessions --marketplace Pregum/claude-mods
