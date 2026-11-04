@@ -24,6 +24,7 @@ const DETAIL_FILES = 3
 /** 動かす間隔。フォーカス中と登場の間だけ動く */
 const FRAME_MS = 66
 const REVEAL_MS = 620
+const REFOCUS_FRAMES = 3
 const KINDS: readonly { kind: TurnKind; label: string; key?: keyof WnTools }[] = [
   { kind: 'edit', label: '編集', key: 'edit' },
   { kind: 'run', label: '実行', key: 'run' },
@@ -307,15 +308,26 @@ async function currentAt($: Engine): Promise<number> {
   return Math.min(last, (await read($, picked)) ?? last)
 }
 
+/** j / k を順に動かす。並んで走ると同じ位置から動いて、押した数だけ進まない */
+let moves: Promise<void> = Promise.resolve()
+
+const queueMove = ($: Engine, by: number): void => {
+  moves = moves.then(() => movePick($, by)).catch(() => undefined)
+}
+
 async function movePick($: Engine, by: number): Promise<void> {
   const map = await read($, sessionMap)
   if (!map || map.turns.length === 0) return
   const at = await currentAt($)
   const next = Math.min(map.turns.length - 1, Math.max(0, at + by))
-  await update($, picked, () => (next === map.turns.length - 1 ? null : next))
-  // フォーカスの帯も一緒に動かす。動かなくても困らないので結果は見ない
-  await $.ui.focus({ requestId: PANE, key: `turn:${next}` }).catch(() => undefined)
-  await $.ui.scroll({ in: PANE, to: { key: `turn:${next}` } }).catch(() => undefined)
+  await setPick($, next)
+  // 帯は tick で移す。ここで移すと描き直しの前の並びに当たり、窓がずれると 1 行ずれる
+  refocus = REFOCUS_FRAMES
+}
+
+async function setPick($: Engine, at: number): Promise<void> {
+  const last = ((await read($, sessionMap))?.turns.length ?? 0) - 1
+  await update($, picked, () => (at === last ? null : at))
 }
 
 /**
@@ -357,6 +369,8 @@ async function runCommand($: Engine, command: string): Promise<void> {
  * 次の描画で戻る。Raster の無い画面では undefined のまま
  */
 let live: { turns: readonly WnTurn[]; at: number; columns: number; isFocused: boolean } | undefined
+/** あと何コマ、選んでいる行へフォーカスの帯を合わせ直すか */
+let refocus = 0
 /** 登場の始まり。動いていなければ undefined */
 let revealFrom: number | undefined
 
@@ -367,6 +381,13 @@ const revealOf = (now: number): number =>
 async function tick($: Engine): Promise<void> {
   const frame = live
   if (!frame || (!frame.isFocused && revealFrom === undefined)) return
+  if (refocus > 0 && frame.isFocused) {
+    // 描き直しが済むまで待てないので、数コマ続けて合わせる。同じ行なら何も起きない
+    refocus -= 1
+    const key = `turn:${frame.at}`
+    await $.ui.focus({ requestId: PANE, key }).catch(() => undefined)
+    await $.ui.scroll({ in: PANE, to: { key } }).catch(() => undefined)
+  }
   const now = await $.clock.now()
   const reveal = revealOf(now)
   const pulse = frame.isFocused ? pulseAt(now) : 0
@@ -390,6 +411,7 @@ async function openPane($: Engine): Promise<void> {
   // プロンプトが空のときだけ通る。/where の直後は空なのでキーが移る
   await $.ui.open({ id: PANE, title: TITLE, focus: true })
   revealFrom = await $.clock.now()
+  refocus = REFOCUS_FRAMES
 }
 
 async function closePane($: Engine): Promise<void> {
@@ -534,6 +556,17 @@ export const register: Register = on => {
       if (listed) await update($, tasks, prev => syncTasks(prev, listed))
     }
     return ran
+  })
+
+  // 矢印・Tab・クリックで帯が依頼の行へ動いたら、選択も合わせる。帯と選択を別々にしない
+  on('ui.focus', { requestId: PANE }, async ($, e, next) => {
+    const done = await next(e)
+    const at = /^turn:(\d+)$/.exec(e.element ?? '')?.[1]
+    if (at !== undefined && e.origin.kind !== 'plugin') {
+      await setPick($, Number(at))
+      refocus = REFOCUS_FRAMES
+    }
+    return done
   })
 
   // 依頼の行が描かれたら id を覚える (描き方は変えない)
@@ -749,8 +782,8 @@ export const register: Register = on => {
 
     const mapKeys = (data: WnMap) => (
       <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
-        <Button key="prev" plain dimColor hotkey="k" label="前" onPress={() => void movePick($, -1)} />
-        <Button key="next" plain dimColor hotkey="j" label="次" onPress={() => void movePick($, 1)} />
+        <Button key="prev" plain dimColor hotkey="k" label="前" onPress={() => queueMove($, -1)} />
+        <Button key="next" plain dimColor hotkey="j" label="次" onPress={() => queueMove($, 1)} />
         <Button key="jump" plain dimColor hotkey="g" label="飛ぶ" onPress={() => jump($, data.turns, at)} />
         <Button key="rewind" plain dimColor hotkey="r" label="巻き戻す" onPress={() => void runCommand($, 'rewind')} />
         <Button key="branch" plain dimColor hotkey="b" label="今から分岐" onPress={() => void runCommand($, 'branch')} />
