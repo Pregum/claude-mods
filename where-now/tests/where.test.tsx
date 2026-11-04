@@ -60,7 +60,6 @@ test('ターンの依頼と、読んだ・書いたファイルを出し、次�
 
   for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect(await ui.find({ type: 'Text', text: /README を直して/ })).toBeDefined()
     expect((await ui.find({ type: 'Text', text: /README\.md/ }))?.text).toBe('· README.md ×2')
     expect((await ui.find({ type: 'Text', text: /a\.ts/ }))?.text).toBe('✎ src/a.ts')
     expect(await ui.find({ type: 'Text', text: /読 1 · 書 1/ })).toBeDefined()
@@ -104,7 +103,7 @@ test('TodoWrite の計画を進み具合つきで出す', async ($, on) => {
     ],
   })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: /─ 計画 1\/3/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /─ 計画 ▰▱▱ 1\/3/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /✓ 調べる/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /▶ 直しています/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /○ 確かめる/ })).toBeDefined()
@@ -127,7 +126,7 @@ test('TaskCreate と TaskUpdate を追い、deleted は消す', async ($, on) =>
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: /一つ目/ })).toBeUndefined()
   expect(await ui.find({ type: 'Text', text: /▶ 二つ目を進行中/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /─ 計画 0\/1/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /─ 計画 ▱ 0\/1/ })).toBeDefined()
   await ui.unmount()
 })
 
@@ -159,6 +158,8 @@ test('/where は開いてキーを渡し、開いていてもキーを渡し、�
   let closes = 0
   withStore(on)
   on('session.root', () => ({ value: '/w/repo' }))
+  on('clock.now', () => ({ value: 0 }))
+  on('clock.every', () => ({ value: { cancel: () => undefined } }) as never)
   on('command.register', () => ({ value: { command: 'where' } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.messages', () => ({ value: [] }))
@@ -226,16 +227,27 @@ test('ミニマップは人の依頼ごとの重さとセッションの長さ�
     ],
   })
   await $.turn.start({ text: '二つ目', turnId: 't' })
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: /セッション · 1時間30分/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /依頼 2/ })).toBeDefined()
-  // 帯: 色が分類、高さが重さ
-  const edit = await ui.find({ type: 'Text', text: /^█$/ })
-  expect(edit?.props?.color).toBe('success')
-  expect(await ui.find({ type: 'Text', text: /^■編集$/ })).toBeDefined()
-  // ゲージ: 幅 24 の 43% は 10 マス
-  expect((await ui.find({ type: 'Text', text: /^█{10}$/ }))?.text).toHaveLength(10)
-  // 選んでいる依頼のまわり: いまの依頼から始まる
+
+  // 端末: 全体マップとゲージは Raster
+  const term = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await term.find({ type: 'Raster', key: 'scope' })).toBeDefined()
+  expect(await term.find({ type: 'Raster', key: 'gauge' })).toBeDefined()
+  expect(await term.find({ type: 'Raster', key: 'rail' })).toBeDefined()
+  expect(await term.find({ type: 'Text', text: /^1時間30分$/ })).toBeDefined()
+  expect(await term.find({ type: 'Text', text: /^#2\/2$/ })).toBeDefined()
+  expect(await term.find({ type: 'Text', text: /■ 編集 1/ })).toBeDefined()
+  expect(await term.find({ type: 'Text', text: /■ 調査 5/ })).toBeDefined()
+  await term.press({ key: 'prev' })
+  expect(await term.find({ type: 'Text', text: /^#1\/2$/ })).toBeDefined()
+  await term.press({ key: 'next' })
+  await term.unmount()
+
+  // Raster の無い画面は 1 行の帯と、› の印
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Raster' })).toBeUndefined()
+  const bar = await ui.find({ type: 'Text', text: /^█$/ })
+  expect(bar?.props.color).toBe('#3fb950')
+  expect(await ui.find({ type: 'Text', text: /文脈 █{13}░{18} 43%/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /^›2 $/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /^ 1 $/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /^ +7$/ })).toBeDefined()

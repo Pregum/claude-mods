@@ -1,7 +1,9 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { TaskStatus, TurnKind, WnFile, WnMap, WnTask, WnTurn } from '../types'
+import type { TaskStatus, TurnKind, WnFile, WnMap, WnTask, WnTools, WnTurn } from '../types'
+import { COLORS, gaugeCells, hex, pulseAt, railCells, scopeCells } from './scope'
+import { shellKind } from './shell'
 
 type Engine = EngineInterface
 
@@ -14,27 +16,30 @@ const CLOSED = 'closed'
 const BARS = '▁▂▃▄▅▆▇█'
 /** 題名つきで並べる依頼の数 */
 const RECENT = 5
-const KINDS: readonly { kind: TurnKind; label: string; color?: string }[] = [
-  { kind: 'edit', label: '編集', color: 'success' },
-  { kind: 'run', label: '実行', color: 'warning' },
-  { kind: 'read', label: '調査', color: 'suggestion' },
-  { kind: 'agent', label: '委任', color: 'error' },
+const SCOPE_ROWS = 4
+const GAUGE_WIDTH = 40
+/** 動かす間隔。フォーカス中と登場の間だけ動く */
+const FRAME_MS = 66
+const REVEAL_MS = 620
+const KINDS: readonly { kind: TurnKind; label: string; key?: keyof WnTools }[] = [
+  { kind: 'edit', label: '編集', key: 'edit' },
+  { kind: 'run', label: '実行', key: 'run' },
+  { kind: 'read', label: '調査', key: 'read' },
+  { kind: 'agent', label: '委任', key: 'agent' },
   { kind: 'talk', label: '会話' },
 ]
 const EDIT_TOOLS = new Set(['Write', 'Edit', 'NotebookEdit'])
 const AGENT_TOOLS = new Set(['Agent', 'Task', 'Workflow'])
 const READ_TOOLS = new Set(['Read', 'Grep', 'Glob', 'WebFetch', 'WebSearch', 'ToolSearch', 'Skill'])
-const RECENT_BAR = 6
 const GAUGE_MAX = 24
 const ASK_CHARS = 80
 
 // 形を変えたら shape の札を変える: 前の版が残した値を読まずに初期値から始める
-const ask = atom({ plugin: 'where-now', key: 'ask' } as const, '')
 const tasks = atom({ plugin: 'where-now', key: 'tasks' } as const, [], { shape: 'tasks-1' })
 const files = atom({ plugin: 'where-now', key: 'files' } as const, [], { shape: 'files-1' })
 /** マップで選んでいる依頼の番号 (0 始まり)。null はいまの依頼 */
 const picked = atom({ plugin: 'where-now', key: 'picked' } as const, null)
-const sessionMap = atom({ plugin: 'where-now', key: 'map' } as const, null, { shape: 'map-4' })
+const sessionMap = atom({ plugin: 'where-now', key: 'map' } as const, null, { shape: 'map-5' })
 
 // ---- 幅 (全角は 2 マス) ----
 
@@ -107,20 +112,27 @@ async function rootOf($: Engine): Promise<string> {
 
 // ---- ミニマップ ----
 
+/** ツールの分類 */
+const toolKind = (tool: string, input: Record<string, unknown> | undefined): keyof WnTools => {
+  if (EDIT_TOOLS.has(tool)) return 'edit'
+  if (AGENT_TOOLS.has(tool)) return 'agent'
+  if (READ_TOOLS.has(tool)) return 'read'
+  const command = input?.command
+  return tool === 'Bash' && typeof command === 'string' ? shellKind(command) : 'run'
+}
+
 /** 依頼の中身の分類。一番残るものを優先する: 編集 > 委任 > 実行 > 調査 > 会話 */
-const kindOf = (tools: ReadonlySet<string>): TurnKind => {
-  const has = (set: ReadonlySet<string>) => [...tools].some(name => set.has(name))
-  if (has(EDIT_TOOLS)) return 'edit'
-  if (has(AGENT_TOOLS)) return 'agent'
-  if (tools.has('Bash')) return 'run'
-  if (has(READ_TOOLS)) return 'read'
-  return tools.size > 0 ? 'run' : 'talk'
+const kindOf = (tools: WnTools): TurnKind => {
+  if (tools.edit > 0) return 'edit'
+  if (tools.agent > 0) return 'agent'
+  if (tools.run > 0) return 'run'
+  return tools.read > 0 ? 'read' : 'talk'
 }
 
 type Row = {
   role: string
   text: string
-  toolUses: readonly { tool: string }[]
+  toolUses: readonly { tool: string; input?: Record<string, unknown> }[]
   toolResults?: readonly unknown[]
 }
 
@@ -128,65 +140,30 @@ const askOf = (text: string): string => text.replace(/\s+/g, ' ').trim().slice(0
 
 /** 人の依頼ごとの題名・重さ・分類。< で始まる文は engine が差し込んだもの */
 const turnsOf = (messages: readonly Row[]): WnTurn[] => {
-  const turns: { text: string; weight: number; tools: Set<string> }[] = []
+  const turns: { text: string; weight: number; tools: WnTools }[] = []
   for (const message of messages) {
     const text = askOf(message.text)
     const isAsk =
       message.role === 'user' && !message.toolResults?.length && text !== '' && !text.startsWith('<')
     if (isAsk) {
-      turns.push({ text, weight: 1, tools: new Set() })
+      turns.push({ text, weight: 1, tools: { edit: 0, run: 0, read: 0, agent: 0 } })
       continue
     }
     const last = turns.at(-1)
     if (!last) continue
     last.weight += message.toolUses.length
-    for (const use of message.toolUses) last.tools.add(use.tool)
+    for (const use of message.toolUses) last.tools[toolKind(use.tool, use.input)] += 1
   }
-  return turns.map(({ text, weight, tools }) => ({ text, weight, kind: kindOf(tools) }))
-}
-
-/** 帯の 1 マス。束ねたマスは一番重い依頼の分類 */
-type Cell = { from: number; to: number; weight: number; kind: TurnKind }
-
-/** 幅に収まるように束ねる。長いセッションほど帯が伸び、幅いっぱいで束ね始める */
-const cellsOfTurns = (turns: readonly WnTurn[], room: number): Cell[] => {
-  const size = Math.max(1, Math.ceil(turns.length / Math.max(1, room)))
-  const out: Cell[] = []
-  for (let i = 0; i < turns.length; i += size) {
-    const group = turns.slice(i, i + size)
-    const heaviest = group.reduce((a, b) => (b.weight > a.weight ? b : a))
-    out.push({
-      from: i,
-      to: i + group.length - 1,
-      weight: group.reduce((sum, one) => sum + one.weight, 0),
-      kind: heaviest.kind,
-    })
-  }
-  return out
+  return turns.map(turn => ({ ...turn, kind: kindOf(turn.tools) }))
 }
 
 const barOf = (weight: number, max: number): string =>
   BARS[Math.min(BARS.length - 1, Math.ceil((weight / Math.max(1, max)) * BARS.length) - 1)] ?? '▁'
 
-const colorOf = (kind: TurnKind): string | undefined => KINDS.find(one => one.kind === kind)?.color
-
-/** 色ごとにまとめて 1 つの Text にする */
-const runsOf = (cellsIn: readonly Cell[], max: number, at: number) => {
-  const runs: { text: string; kind: TurnKind; isHere: boolean }[] = []
-  for (const cell of cellsIn) {
-    const isHere = at >= cell.from && at <= cell.to
-    const last = runs.at(-1)
-    if (last && last.kind === cell.kind && !last.isHere && !isHere) last.text += barOf(cell.weight, max)
-    else runs.push({ text: barOf(cell.weight, max), kind: cell.kind, isHere })
-  }
-  return runs
-}
+const colorOf = (kind: TurnKind): string => hex(COLORS[kind])
 
 const padTo = (text: string, room: number): string =>
   `${text}${' '.repeat(Math.max(0, room - cells(text)))}`
-
-const gaugeColor = (percent: number): 'success' | 'warning' | 'error' =>
-  percent >= 85 ? 'error' : percent >= 60 ? 'warning' : 'success'
 
 const lengthOf = (ms: number): string => {
   const minutes = Math.max(0, Math.floor(ms / 60_000))
@@ -288,6 +265,9 @@ async function movePick($: Engine, by: number): Promise<void> {
   const at = await currentAt($)
   const next = Math.min(map.turns.length - 1, Math.max(0, at + by))
   await update($, picked, () => (next === map.turns.length - 1 ? null : next))
+  // フォーカスの帯も一緒に動かす。動かなくても困らないので結果は見ない
+  await $.ui.focus({ requestId: PANE, key: `turn:${next}` }).catch(() => undefined)
+  await $.ui.scroll({ in: PANE, to: { key: `turn:${next}` } }).catch(() => undefined)
 }
 
 /**
@@ -322,15 +302,50 @@ async function runCommand($: Engine, command: string): Promise<void> {
   }
 }
 
+// ---- 動き ----
+
+/**
+ * blit に渡す今の絵。描くたびに描画が更新する。モジュールの変数なので読み直しで消えるが、
+ * 次の描画で戻る。Raster の無い画面では undefined のまま
+ */
+let live: { turns: readonly WnTurn[]; at: number; columns: number; isFocused: boolean } | undefined
+/** 登場の始まり。動いていなければ undefined */
+let revealFrom: number | undefined
+
+const revealOf = (now: number): number =>
+  revealFrom === undefined ? 1 : Math.min(1, (now - revealFrom) / REVEAL_MS)
+
+/** 選んでいる列と行を脈打たせ、登場の間は全体を描き直す。止まっているときは何もしない */
+async function tick($: Engine): Promise<void> {
+  const frame = live
+  if (!frame || (!frame.isFocused && revealFrom === undefined)) return
+  const now = await $.clock.now()
+  const reveal = revealOf(now)
+  const pulse = frame.isFocused ? pulseAt(now) : 0
+  const blit = (key: string, columns: number, rows: number, cells: string) =>
+    $.ui.blit({ requestId: PANE, key, columns, rows, cells }).catch(() => undefined)
+  await blit(
+    'scope',
+    frame.columns,
+    SCOPE_ROWS,
+    scopeCells({ turns: frame.turns, at: frame.at, columns: frame.columns, rows: SCOPE_ROWS, pulse, reveal }),
+  )
+  const turn = frame.turns[frame.at]
+  if (turn) await blit('rail', 1, 1, railCells(COLORS[turn.kind], pulse))
+  if (reveal >= 1) revealFrom = undefined
+}
+
 // ---- 開け閉め ----
 
 async function openPane($: Engine): Promise<void> {
   await $.store.delete(CLOSED)
   // プロンプトが空のときだけ通る。/where の直後は空なのでキーが移る
   await $.ui.open({ id: PANE, title: TITLE, focus: true })
+  revealFrom = await $.clock.now()
 }
 
 async function closePane($: Engine): Promise<void> {
+  live = undefined
   await $.store.set(CLOSED, true)
   await $.ui.close({ id: PANE })
 }
@@ -354,6 +369,7 @@ export const register: Register = on => {
     })
     // 手で閉じていたら開かない。頼まれずに開くペインは幅が足りるまで待つ
     if (!(await $.store.get(CLOSED))) void $.ui.open({ id: PANE, title: TITLE })
+    $.clock.every(FRAME_MS, () => void tick($))
     const done = await next(e)
     await refreshMap($)
     return done
@@ -366,6 +382,7 @@ export const register: Register = on => {
 
   // ctrl+x x や閉じる印で閉じたときも覚える
   on('ui.close', { id: PANE }, async ($, e, next) => {
+    live = undefined
     await $.store.set(CLOSED, true)
     return next(e)
   })
@@ -373,7 +390,6 @@ export const register: Register = on => {
   // 人の依頼で切り替える。サブエージェントの開始と、文の無い続きでは消さない
   on('turn.start', async ($, e, next) => {
     if (e.agentId === undefined && e.text !== '') {
-      await update($, ask, () => e.text)
       await update($, files, () => [])
     }
     const done = await next(e)
@@ -479,11 +495,12 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Button } = $.ui.resolve(e)
+    const els = $.ui.resolve(e)
+    const { Box, Text, Button } = els
+    const Raster = e.surface === 'terminal' && 'Raster' in els ? els.Raster : undefined
     const map = await read($, sessionMap)
     const chosen = await read($, picked)
     const now = await $.clock.now()
-    const asked = await read($, ask)
     const plan = await read($, tasks)
     const touched = await read($, files)
     const root = await rootOf($)
@@ -495,49 +512,112 @@ export const register: Register = on => {
 
     const at = map ? Math.min(map.turns.length - 1, chosen ?? map.turns.length - 1) : 0
 
-    /** 全体の帯。色が中身、高さがツールの数、反転が選んでいる依頼 */
-    const strip = (data: WnMap) => {
-      const label = `依頼 ${data.turns.length} `
-      const cellsIn = cellsOfTurns(data.turns, width - cells(label))
-      const max = Math.max(1, ...cellsIn.map(cell => cell.weight))
+    const isFocused = e.props.isFocused
+    const scopeWidth = Math.min(512, width)
+    live = map && Raster ? { turns: map.turns, at, columns: scopeWidth, isFocused } : undefined
+    const pulse = isFocused ? pulseAt(now) : 0
+
+    const toolCount = (turn: WnTurn) => turn.weight - 1
+    const countsOf = (turns: readonly WnTurn[]) =>
+      KINDS.flatMap(one => {
+        if (!one.key) return []
+        const key = one.key
+        const count = turns.reduce((sum, turn) => sum + turn.tools[key], 0)
+        return count > 0 ? [{ ...one, count }] : []
+      })
+
+    /** 見出し: 何の画面かと、3 つの数字 */
+    const header = (data: WnMap) => {
+      const total = data.turns.reduce((sum, turn) => sum + toolCount(turn), 0)
+      const length = lengthOf(now - data.startedAt)
+      const title = '◆ 今どこ'
       return (
-        <Box flexDirection="row">
-          <Text>{label}</Text>
-          {runsOf(cellsIn, max, at).map(run => {
-            const color = colorOf(run.kind)
-            return (
-              <Text
-                {...(color ? { color } : { dimColor: true })}
-                {...(run.isHere ? { inverse: true } : {})}
-              >
-                {run.text}
-              </Text>
-            )
-          })}
+        <Box flexDirection="column">
+          <Box flexDirection="row" columnGap={2} flexWrap="wrap">
+            <Text bold color="claude">{title}</Text>
+            <Text bold>{length}</Text>
+            <Text bold>{String(data.turns.length)}<Text dimColor> 依頼</Text></Text>
+            <Text bold>{String(total)}<Text dimColor> ツール</Text></Text>
+          </Box>
         </Box>
       )
     }
 
-    const legend = () => (
-      <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
-        {KINDS.map(one => (
-          <Text {...(one.color ? { color: one.color } : { dimColor: true })}>{`■${one.label}`}</Text>
+    /** 全体マップ。Raster の無い画面は 1 行の帯にする */
+    const scope = (data: WnMap) => {
+      if (Raster) {
+        return (
+          <Raster
+            key="scope"
+            columns={scopeWidth}
+            rows={SCOPE_ROWS}
+            cells={scopeCells({
+              turns: data.turns,
+              at,
+              columns: scopeWidth,
+              rows: SCOPE_ROWS,
+              pulse,
+              reveal: revealOf(now),
+            })}
+          />
+        )
+      }
+      const max = Math.max(1, ...data.turns.map(turn => turn.weight))
+      const room = Math.max(1, width)
+      const shown = data.turns.slice(-room)
+      const shift = data.turns.length - shown.length
+      return (
+        <Box flexDirection="row">
+          {shown.map((turn, i) => (
+            <Text color={colorOf(turn.kind)} {...(i + shift === at ? { inverse: true } : {})}>
+              {barOf(turn.weight, max)}
+            </Text>
+          ))}
+        </Box>
+      )
+    }
+
+    /** マップの下の目盛りと、選んでいる依頼の内訳 */
+    const ruler = (data: WnMap) => {
+      const turn = data.turns[at]
+      if (!turn) return undefined
+      const left = `#${at + 1}/${data.turns.length}`
+      return (
+        <Box flexDirection="row" columnGap={2} flexWrap="wrap">
+          <Text bold color={colorOf(turn.kind)}>{left}</Text>
+          {countsOf([turn]).map(one => (
+            <Text color={colorOf(one.kind)}>{`${one.label} ${one.count}`}</Text>
+          ))}
+          {toolCount(turn) === 0 && <Text dimColor>会話のみ</Text>}
+        </Box>
+      )
+    }
+
+    const legend = (data: WnMap) => (
+      <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
+        {countsOf(data.turns).map(one => (
+          <Text color={colorOf(one.kind)}>{`■ ${one.label} ${one.count}`}</Text>
         ))}
       </Box>
     )
 
-    /** コンテキストをどれだけ使ったか */
+    /** コンテキストをどれだけ使ったか。色は位置で決まり、右へ進むほど赤い */
     const gauge = (percent: number) => {
       const label = '文脈 '
       const tail = ` ${percent}%`
-      const room = Math.min(GAUGE_MAX, Math.max(4, width - cells(label) - cells(tail)))
+      const room = Math.min(GAUGE_WIDTH, Math.max(4, width - cells(label) - cells(tail)))
+      if (Raster) {
+        return (
+          <Box flexDirection="row">
+            <Text dimColor>{label}</Text>
+            <Raster key="gauge" columns={room} rows={1} cells={gaugeCells(percent, room)} />
+            <Text bold>{tail}</Text>
+          </Box>
+        )
+      }
       const used = Math.min(room, Math.round((percent / 100) * room))
       return (
-        <Box flexDirection="row">
-          <Text>{label}</Text>
-          <Text color={gaugeColor(percent)}>{'█'.repeat(used)}</Text>
-          <Text dimColor>{`${'░'.repeat(room - used)}${tail}`}</Text>
-        </Box>
+        <Text dimColor>{`${label}${'█'.repeat(used)}${'░'.repeat(room - used)}${tail}`}</Text>
       )
     }
 
@@ -545,21 +625,29 @@ export const register: Register = on => {
     const turnRow = (data: WnMap, turn: WnTurn, index: number) => {
       const isHere = index === at
       const color = colorOf(turn.kind)
-      const head = `${isHere ? '›' : ' '}${String(index + 1).padStart(String(data.turns.length).length)} `
-      const tail = ` ${String(turn.weight - 1).padStart(3)}`
+      const hasRail = isHere && Raster !== undefined
+      const number = String(index + 1).padStart(String(data.turns.length).length)
+      const head = `${isHere && !Raster ? '›' : ' '}${number} `
+      const tail = ` ${String(toolCount(turn)).padStart(3)}`
       const room = Math.max(4, width - cells(head) - cells(tail) - 2)
       return (
-        <Button
-          key={`turn:${index}`}
-          plain
-          {...(isHere ? { autoFocus: true as const } : {})}
-          onPress={() => jump($, data.turns, index)}
-        >
-          <Text bold={isHere}>{head}</Text>
-          <Text {...(color ? { color } : { dimColor: true })}>{'▌ '}</Text>
-          <Text bold={isHere}>{padTo(fit(turn.text, room), room)}</Text>
-          <Text dimColor>{tail}</Text>
-        </Button>
+        <Box flexDirection="row" key={`row:${index}`}>
+          {hasRail && Raster ? (
+            <Raster key="rail" columns={1} rows={1} cells={railCells(COLORS[turn.kind], pulse)} />
+          ) : (
+            <Text color={color} dimColor={!isHere}>{Raster ? '▏' : ' '}</Text>
+          )}
+          <Button
+            key={`turn:${index}`}
+            plain
+            {...(isHere ? { autoFocus: true as const } : {})}
+            onPress={() => jump($, data.turns, index)}
+          >
+            <Text dimColor={!isHere} bold={isHere}>{head}</Text>
+            <Text bold={isHere} dimColor={!isHere}>{padTo(fit(turn.text, room), room)}</Text>
+            <Text color={color} dimColor={!isHere}>{tail}</Text>
+          </Button>
+        </Box>
       )
     }
 
@@ -606,14 +694,16 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column">
-        {map && <Text dimColor>{fit(`─ セッション · ${lengthOf(now - map.startedAt)}`, width)}</Text>}
-        {map && map.turns.length > 0 && strip(map)}
-        {map && map.turns.length > 0 && legend()}
+        {map && header(map)}
+        {map && map.turns.length > 0 && scope(map)}
+        {map && map.turns.length > 0 && ruler(map)}
+        {map && map.turns.length > 0 && legend(map)}
         {map && map.percent !== undefined && gauge(map.percent)}
+        <Text> </Text>
         {map && map.turns.length > 0 && shownTurns(map)}
         {map && map.turns.length > 0 && mapKeys(map)}
-        {asked !== '' && <Text bold>{fit(asked, width)}</Text>}
-        <Text dimColor>{`─ 計画${plan.length > 0 ? ` ${doneCount}/${plan.length}` : ''}`}</Text>
+        <Text> </Text>
+        <Text dimColor>{`─ 計画${plan.length > 0 ? ` ${'▰'.repeat(doneCount)}${'▱'.repeat(plan.length - doneCount)} ${doneCount}/${plan.length}` : ''}`}</Text>
         {plan.length === 0 && <Text dimColor>計画はありません</Text>}
         {plan.map(taskRow)}
         <Text dimColor>{`─ このターン · 読 ${readCount} · 書 ${writeCount}`}</Text>
