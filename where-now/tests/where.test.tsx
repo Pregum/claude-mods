@@ -275,6 +275,40 @@ test('ゲージは自動 compact の地点までの進みを出す', async ($, o
   await term.unmount()
 })
 
+test('選んでいる依頼のツール・MCP・編集したファイルを出す', async ($, on) => {
+  host(on, undefined, {
+    messages: [
+      {
+        role: 'user', text: '直して', toolUses: [],
+      },
+      {
+        role: 'assistant',
+        text: '',
+        toolUses: [
+          { tool: 'Read', input: { file_path: '/w/repo/a.ts' } },
+          { tool: 'Edit', input: { file_path: '/w/repo/src/a.ts' } },
+          { tool: 'Edit', input: { file_path: '/w/repo/src/a.ts' } },
+          { tool: 'Write', input: { file_path: '/w/repo/b.ts' } },
+          { tool: 'mcp__claude_ai_Slack__slack_send_message', input: {} },
+          { tool: 'mcp__claude_ai_Slack__slack_read_thread', input: {} },
+          { tool: 'mcp__notion__notion-search', input: {} },
+        ],
+      },
+    ],
+  })
+  await $.turn.start({ text: '直して', turnId: 't' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^Edit 2$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^Read 1$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^MCP$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^Slack 2$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^notion 1$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^✎ src\/a\.ts ×2$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^✎ b\.ts$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /mcp__/ })).toBeUndefined()
+  await ui.unmount()
+})
+
 const JUMP_MESSAGES = [
   { role: 'user', text: '調べて', toolUses: [] },
   { role: 'assistant', text: '済み', toolUses: [{ tool: 'Grep' }] },

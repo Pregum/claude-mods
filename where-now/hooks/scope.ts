@@ -1,13 +1,14 @@
 import type { TurnKind, WnTools, WnTurn } from '../types'
 
 /** 下から積む順。重い作業ほど上に来る */
-export const STACK: readonly (keyof WnTools)[] = ['read', 'run', 'agent', 'edit']
+export const STACK: readonly (keyof WnTools)[] = ['read', 'run', 'mcp', 'agent', 'edit']
 
 export const COLORS: Record<TurnKind, number> = {
   edit: 0x3fb950,
   run: 0xe3b341,
   read: 0x58a6ff,
   agent: 0xd2a8ff,
+  mcp: 0x39c5cf,
   talk: 0x6e7681,
 }
 
@@ -50,7 +51,7 @@ export const columnsOf = (turns: readonly WnTurn[], width: number): Column[] => 
     const from = Math.floor((x * turns.length) / width)
     const to = Math.max(from, Math.floor(((x + 1) * turns.length) / width) - 1)
     const group = turns.slice(from, to + 1)
-    const tools = { edit: 0, run: 0, read: 0, agent: 0 }
+    const tools = { edit: 0, run: 0, read: 0, agent: 0, mcp: 0 }
     for (const turn of group) {
       for (const key of STACK) tools[key] += turn.tools[key]
     }

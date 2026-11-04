@@ -21,10 +21,13 @@ export type WnFile = {
 }
 
 /** 依頼で主に何をしたか */
-export type TurnKind = 'edit' | 'run' | 'read' | 'agent' | 'talk'
+export type TurnKind = 'edit' | 'run' | 'read' | 'agent' | 'mcp' | 'talk'
 
 /** ツールの呼び出し数の内訳 */
-export type WnTools = { edit: number; run: number; read: number; agent: number }
+export type WnTools = { edit: number; run: number; read: number; agent: number; mcp: number }
+
+/** 名前ごとの回数。多い順に持つ */
+export type WnCount = { name: string; count: number }
 
 export type WnTurn = {
   /** 依頼の行の id。トランスクリプトから引けなければ無し */
@@ -32,6 +35,12 @@ export type WnTurn = {
   text: string
   kind: TurnKind
   tools: WnTools
+  /** 使ったツール。MCP は servers に分ける */
+  names: WnCount[]
+  /** 使った MCP サーバー */
+  servers: WnCount[]
+  /** Write / Edit / NotebookEdit で編集したファイル */
+  edits: WnCount[]
   /** 依頼 1 + ツールの呼び出し数 */
   weight: number
 }

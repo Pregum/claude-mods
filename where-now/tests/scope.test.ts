@@ -8,7 +8,10 @@ const turn = (edit: number, read: number): WnTurn => ({
   text: 't',
   kind: edit > 0 ? 'edit' : 'read',
   weight: 1 + edit + read,
-  tools: { edit, run: 0, read, agent: 0 },
+  tools: { edit, run: 0, read, agent: 0, mcp: 0 },
+  names: [],
+  servers: [],
+  edits: [],
 })
 
 const words = (cells: string) => {

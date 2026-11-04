@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { TaskStatus, TurnKind, WnFile, WnMap, WnTask, WnTools, WnTurn } from '../types'
+import type { TaskStatus, TurnKind, WnCount, WnFile, WnMap, WnTask, WnTools, WnTurn } from '../types'
 import { COLORS, gaugeCells, hex, pulseAt, railCells, scopeCells } from './scope'
 import { shellKind } from './shell'
 
@@ -18,6 +18,9 @@ const BARS = '▁▂▃▄▅▆▇█'
 const RECENT = 5
 const SCOPE_ROWS = 4
 const GAUGE_WIDTH = 40
+/** 選んでいる依頼の詳しい欄に並べる数 */
+const DETAIL_TOOLS = 6
+const DETAIL_FILES = 3
 /** 動かす間隔。フォーカス中と登場の間だけ動く */
 const FRAME_MS = 66
 const REVEAL_MS = 620
@@ -26,6 +29,7 @@ const KINDS: readonly { kind: TurnKind; label: string; key?: keyof WnTools }[] =
   { kind: 'run', label: '実行', key: 'run' },
   { kind: 'read', label: '調査', key: 'read' },
   { kind: 'agent', label: '委任', key: 'agent' },
+  { kind: 'mcp', label: 'MCP', key: 'mcp' },
   { kind: 'talk', label: '会話' },
 ]
 const EDIT_TOOLS = new Set(['Write', 'Edit', 'NotebookEdit'])
@@ -39,7 +43,7 @@ const tasks = atom({ plugin: 'where-now', key: 'tasks' } as const, [], { shape: 
 const files = atom({ plugin: 'where-now', key: 'files' } as const, [], { shape: 'files-1' })
 /** マップで選んでいる依頼の番号 (0 始まり)。null はいまの依頼 */
 const picked = atom({ plugin: 'where-now', key: 'picked' } as const, null)
-const sessionMap = atom({ plugin: 'where-now', key: 'map' } as const, null, { shape: 'map-6' })
+const sessionMap = atom({ plugin: 'where-now', key: 'map' } as const, null, { shape: 'map-7' })
 
 // ---- 幅 (全角は 2 マス) ----
 
@@ -116,6 +120,7 @@ async function rootOf($: Engine): Promise<string> {
 const toolKind = (tool: string, input: Record<string, unknown> | undefined): keyof WnTools => {
   if (EDIT_TOOLS.has(tool)) return 'edit'
   if (AGENT_TOOLS.has(tool)) return 'agent'
+  if (tool.startsWith('mcp__')) return 'mcp'
   if (READ_TOOLS.has(tool)) return 'read'
   const command = input?.command
   return tool === 'Bash' && typeof command === 'string' ? shellKind(command) : 'run'
@@ -125,6 +130,7 @@ const toolKind = (tool: string, input: Record<string, unknown> | undefined): key
 const kindOf = (tools: WnTools): TurnKind => {
   if (tools.edit > 0) return 'edit'
   if (tools.agent > 0) return 'agent'
+  if (tools.mcp > 0) return 'mcp'
   if (tools.run > 0) return 'run'
   return tools.read > 0 ? 'read' : 'talk'
 }
@@ -136,31 +142,66 @@ type Row = {
   toolResults?: readonly unknown[]
 }
 
+/** mcp__claude_ai_Slack__slack_send → Slack。本体が付ける接頭辞を落とす */
+export const serverOf = (tool: string): string =>
+  (tool.split('__')[1] ?? tool).replace(/^(claude_ai_|plugin_)/, '')
+
+const countUp = (list: { name: string; count: number }[], name: string): void => {
+  const found = list.find(one => one.name === name)
+  if (found) found.count += 1
+  else list.push({ name, count: 1 })
+}
+
+const byCount = (list: readonly WnCount[]): WnCount[] =>
+  [...list].sort((a, b) => b.count - a.count)
+
+/** 編集したファイル。Bash で書いたものはコマンドから確実には読めないので入らない */
+const editedPath = (tool: string, input: Record<string, unknown> | undefined): string | undefined => {
+  if (!EDIT_TOOLS.has(tool)) return undefined
+  const path = input?.file_path ?? input?.notebook_path
+  return typeof path === 'string' ? path : undefined
+}
+
 const askOf = (text: string): string => text.replace(/\s+/g, ' ').trim().slice(0, ASK_CHARS)
 
 /** 人の依頼ごとの題名・重さ・分類。< で始まる文は engine が差し込んだもの */
 const turnsOf = (messages: readonly Row[]): WnTurn[] => {
-  const turns: { text: string; weight: number; tools: WnTools }[] = []
+  const turns: Omit<WnTurn, 'kind'>[] = []
   for (const message of messages) {
     const text = askOf(message.text)
     const isAsk =
       message.role === 'user' && !message.toolResults?.length && text !== '' && !text.startsWith('<')
     if (isAsk) {
-      turns.push({ text, weight: 1, tools: { edit: 0, run: 0, read: 0, agent: 0 } })
+      turns.push({ text, weight: 1, tools: { edit: 0, run: 0, read: 0, agent: 0, mcp: 0 }, names: [], servers: [], edits: [] })
       continue
     }
     const last = turns.at(-1)
     if (!last) continue
     last.weight += message.toolUses.length
-    for (const use of message.toolUses) last.tools[toolKind(use.tool, use.input)] += 1
+    for (const use of message.toolUses) {
+      last.tools[toolKind(use.tool, use.input)] += 1
+      if (use.tool.startsWith('mcp__')) countUp(last.servers, serverOf(use.tool))
+      else countUp(last.names, use.tool)
+      const edited = editedPath(use.tool, use.input)
+      if (edited) countUp(last.edits, edited)
+    }
   }
-  return turns.map(turn => ({ ...turn, kind: kindOf(turn.tools) }))
+  return turns.map(turn => ({
+    ...turn,
+    kind: kindOf(turn.tools),
+    names: byCount(turn.names),
+    servers: byCount(turn.servers),
+    edits: byCount(turn.edits),
+  }))
 }
 
 const barOf = (weight: number, max: number): string =>
   BARS[Math.min(BARS.length - 1, Math.ceil((weight / Math.max(1, max)) * BARS.length) - 1)] ?? '▁'
 
 const colorOf = (kind: TurnKind): string => hex(COLORS[kind])
+
+/** Bash は中身で分かれるので、名前だけのときは実行の色 */
+const toolColor = (tool: string): TurnKind => toolKind(tool, undefined)
 
 const padTo = (text: string, room: number): string =>
   `${text}${' '.repeat(Math.max(0, room - cells(text)))}`
@@ -600,6 +641,41 @@ export const register: Register = on => {
       )
     }
 
+    /** 選んでいる依頼で何を使い、何を編集したか */
+    const detail = (data: WnMap) => {
+      const turn = data.turns[at]
+      if (!turn || turn.weight === 1) return undefined
+      const line = (one: WnCount) => `${one.name} ${one.count}`
+      const hidden = turn.names.length - DETAIL_TOOLS
+      const moreFiles = turn.edits.length - DETAIL_FILES
+      return (
+        <Box flexDirection="column">
+          {turn.names.length > 0 && (
+            <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
+              {turn.names.slice(0, DETAIL_TOOLS).map(one => (
+                <Text color={colorOf(toolColor(one.name))}>{line(one)}</Text>
+              ))}
+              {hidden > 0 && <Text dimColor>{`+${hidden}`}</Text>}
+            </Box>
+          )}
+          {turn.servers.length > 0 && (
+            <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
+              <Text color={colorOf('mcp')} bold>MCP</Text>
+              {turn.servers.map(one => (
+                <Text color={colorOf('mcp')}>{line(one)}</Text>
+              ))}
+            </Box>
+          )}
+          {turn.edits.slice(0, DETAIL_FILES).map(one => (
+            <Text color={colorOf('edit')}>
+              {`✎ ${fit(relativeTo(root, one.name), width - 6, true)}${one.count > 1 ? ` ×${one.count}` : ''}`}
+            </Text>
+          ))}
+          {moreFiles > 0 && <Text dimColor>{`  ほか ${moreFiles} 件`}</Text>}
+        </Box>
+      )
+    }
+
     const legend = (data: WnMap) => (
       <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
         {countsOf(data.turns).map(one => (
@@ -712,6 +788,7 @@ export const register: Register = on => {
         {map && header(map)}
         {map && map.turns.length > 0 && scope(map)}
         {map && map.turns.length > 0 && ruler(map)}
+        {map && map.turns.length > 0 && detail(map)}
         {map && map.turns.length > 0 && legend(map)}
         {map && (map.compact || map.percent !== undefined) && gauge(map)}
         <Text> </Text>
