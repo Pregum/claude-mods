@@ -24,6 +24,11 @@
       "name": "artifact-dates",
       "source": "./artifact-dates",
       "description": "Artifact を更新日で分けて並べ、本文をのぞいて、続きを頼む・作った会話へ戻る"
+    },
+    {
+      "name": "skill-map",
+      "source": "./skill-map",
+      "description": "スキル・コマンド・エージェント・plugin のつながりをペインで見て、付け替えや組み合わせの依頼をプロンプトに下書きする"
     }
   ]
 }

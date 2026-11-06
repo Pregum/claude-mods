@@ -1,0 +1,9 @@
+{
+  "name": "skill-map",
+  "version": "0.4.1",
+  "description": "スキル・コマンド・エージェント・plugin のつながりをペインで見て、付け替えや組み合わせの依頼をプロンプトに下書きする",
+  "author": {
+    "name": "Pregum"
+  },
+  "types": "./types/index.d.ts"
+}
