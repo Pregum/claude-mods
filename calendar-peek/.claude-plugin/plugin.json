@@ -1,0 +1,9 @@
+{
+  "name": "calendar-peek",
+  "version": "0.1.0",
+  "description": "Google Calendar の直近の予定をペインとステータス行に表示する",
+  "author": {
+    "name": "Pregum"
+  },
+  "types": "./types/index.d.ts"
+}

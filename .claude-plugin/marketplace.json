@@ -29,6 +29,11 @@
       "name": "skill-map",
       "source": "./skill-map",
       "description": "スキル・コマンド・エージェント・plugin のつながりをペインで見て、付け替えや組み合わせの依頼をプロンプトに下書きする"
+    },
+    {
+      "name": "calendar-peek",
+      "source": "./calendar-peek",
+      "description": "Google Calendar の直近の予定をペインとステータス行に表示する"
     }
   ]
 }
